@@ -1,79 +1,62 @@
 # engine.py
-import os, time, json, requests
-from typing import List
+import os
+import ccxt
 
-# -------- env / config --------
-SUPABASE_URL         = os.getenv("SUPABASE_URL")                 # optional here
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")         # optional here
-WORKER_URL           = os.getenv("WORKER_URL") or os.getenv("ALERT_WEBHOOK_URL")  # your Cloudflare Worker URL
-PASS_KEY             = os.getenv("PASS_KEY")                     # Worker pass
-WATCHLIST            = os.getenv("WATCHLIST",
-                                 "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT").split(",")
+# Build the pair list: from PAIRS env or default 20
+DEFAULT_PAIRS = (
+    "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT,XRP/USDT,"
+    "HYPE/USDT,XLM/USDT,SUI/USDT,LINK/USDT,HBAR/USDT,"
+    "BCH/USDT,AVAX/USDT,LTC/USDT,DOT/USDT,UNI/USDT,"
+    "AAVE/USDT,ENA/USDT,TAO/USDT,PENDLE/USDT,VIRTUAL/USDT"
+)
 
-_loop_period = 60
-def set_loop_period(s:int):  # called by app
-    global _loop_period
-    _loop_period = max(15, int(s))
+def _normalize_pairs(raw: str):
+    items = [p.strip() for p in raw.split(",") if p.strip()]
+    # Accept BTCUSDT or BTC/USDT; convert to CCXT format
+    fixed = []
+    for p in items:
+        if "/" in p:
+            fixed.append(p.upper())
+        else:
+            # e.g. BTCUSDT -> BTC/USDT
+            if p.upper().endswith("USDT"):
+                fixed.append(p[:-4].upper() + "/USDT")
+            else:
+                fixed.append(p.upper())
+    return fixed
 
-# -------- helpers --------
-def _synthetic_ticket(symbol: str):
-    """
-    Build a tiny *valid* ticket for your Worker decision() to ACCEPT.
-    You can replace this with real OHLCV logic later.
-    """
-    # make a fake mid and narrow band so SL width < 1.26%
-    mid = 100.0
-    entry_low, entry_high = mid*0.999, mid*1.001
-    sl  = mid*0.988  # ~1.2%
-    return {
-        "symbol": symbol,
-        "side": "LONG",
-        "entry": [round(entry_low, 3), round(entry_high, 3)],
-        "entry_mid": round(mid, 3),
-        "sl": round(sl, 3),
-        "tp1": round(mid*1.01, 3),
-        "tp2": round(mid*1.02, 3),
-        "tp3": round(mid*1.03, 3),
-        "macd_slope": "up",
-        "rsi": 55.0,
-        "atr1h_pct": 0.8,
-        "tf": "1h"
-    }
+PAIRS = _normalize_pairs(os.getenv("PAIRS", DEFAULT_PAIRS))
 
-def _post_to_worker(ticket: dict):
-    if not WORKER_URL or not PASS_KEY:
-        print("worker not configured (WORKER_URL/PASS_KEY missing); skipping", flush=True)
-        return {"ok": False, "skipped": True}
+# CCXT public client (no keys required for fetch_ticker)
+exchange = ccxt.mexc()
 
-    url = f"{WORKER_URL}?t={PASS_KEY}"
-    r = requests.post(url, json=ticket, timeout=20)
-    try:
-        data = r.json()
-    except Exception:
-        data = {"ok": False, "error": f"non-json: {r.text[:200]}", "code": r.status_code}
-    print("worker decision:", json.dumps(data)[:300], flush=True)
-    return data
-
-# -------- one tick --------
 def tick_once():
     """
-    One engine iteration:
-    - build a ticket per coin (synthetic for now)
-    - send to Worker → Worker logs to Supabase & maybe creates order
+    Minimal 'scan' — ping public ticker for each symbol to prove
+    engine wiring works. Replace with your JIM rules later.
     """
-    t0 = time.strftime("%H:%M:%S")
-    print(f"[{t0}] tick start — period { _loop_period }s — {len(WATCHLIST)} symbols", flush=True)
+    scanned = 0
+    got = []
+    errors = []
 
-    for sym in WATCHLIST:
-        sym = sym.strip().upper()
-        if not sym:
-            continue
-        ticket = _synthetic_ticket(sym)
-        resp = _post_to_worker(ticket)
-        # Optional: simple routing message based on decision
-        if resp.get("ok") and resp.get("state") == "GO":
-            print(f"→ {sym}: GO — order_id={resp.get('order_id')}", flush=True)
-        else:
-            print(f"→ {sym}: WAIT — {resp.get('note')}", flush=True)
+    for sym in PAIRS:
+        try:
+            t = exchange.fetch_ticker(sym)
+            scanned += 1
+            got.append({"symbol": sym.replace("/", ""), "last": t.get("last")})
+        except Exception as e:
+            # keep going even if one fails
+            errors.append({"symbol": sym, "error": str(e)[:120]})
 
-    print(f"[{time.strftime('%H:%M:%S')}] tick end", flush=True)
+    note = "public fetch_ticker via CCXT"
+    if errors:
+        note += f" | {len(errors)} error(s)"
+
+    return {
+        "engine": "ok",
+        "scanned": scanned,
+        "pairs": [g["symbol"] for g in got],
+        "note": note,
+        "sample": got[:5],   # small sample so you can see prices
+        "errors": errors[:3] # show a couple if any
+    }
