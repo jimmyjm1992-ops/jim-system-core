@@ -1,19 +1,35 @@
-# app.py (confirm these exist)
-from flask import Flask, jsonify
-import threading, time
+# app.py
+import os, time, threading
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
 
-app = Flask(__name__)
+# --- Your engine (import your real logic) ---
+from engine import tick_once  # implement in engine.py
 
-@app.get("/health")
+app = FastAPI()
+
+class PingOut(BaseModel):
+    ok: bool
+    msg: str
+
+@app.get("/health", response_model=PingOut)
 def health():
-    return jsonify(ok=True, msg="alive")
+    return {"ok": True, "msg": "alive"}
 
-def run_loop():
-    # import your engine here and start the background loop
+def loop_runner():
+    """Background loop: calls engine every N seconds."""
+    period_s = int(os.getenv("LOOP_PERIOD_S", "60"))
     while True:
-        # engine.tick()  # your periodic work
-        time.sleep(60)
+        try:
+            tick_once()
+        except Exception as e:
+            # keep going even if one iteration fails
+            print("loop error:", e, flush=True)
+        time.sleep(period_s)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8000)
+    # start background loop
+    threading.Thread(target=loop_runner, daemon=True).start()
+    # run web server for health check & future endpoints
+    uvicorn.run(app, host="0.0.0.0", port=8000)
