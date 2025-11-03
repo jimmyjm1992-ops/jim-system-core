@@ -1,1 +1,2 @@
-worker: python engine_loop.py
+web: python app.py
+worker: python loop.py
