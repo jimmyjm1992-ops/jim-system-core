@@ -1,14 +1,10 @@
-# app.py
+# app.py — FastAPI surface for health + manual tick
+
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
+from engine import tick_once, WATCHLIST  # import from engine
 
-try:
-    from engine import tick_once
-except Exception:
-    def tick_once():
-        return {"status": "engine not loaded"}
-
-app = FastAPI(title="JIM System Core", version="0.1.0")
+app = FastAPI(title="JIM System Core", version="1.0.0")
 
 @app.get("/")
 def root():
@@ -16,7 +12,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "engine": "running"}
+    return {"ok": True, "engine": "running", "watchlist": WATCHLIST}
 
 @app.get("/tick")
 def tick():
