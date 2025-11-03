@@ -17,6 +17,15 @@ class PingOut(BaseModel):
 def health():
     return {"ok": True, "msg": "alive"}
 
+@app.get("/tick")
+def tick():
+    """Manually trigger one engine iteration"""
+    try:
+        res = tick_once()
+        return {"ok": True, "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def loop_runner():
     """Background loop: calls engine every N seconds."""
     period_s = int(os.getenv("LOOP_PERIOD_S", "60"))
@@ -28,8 +37,12 @@ def loop_runner():
             print("loop error:", e, flush=True)
         time.sleep(period_s)
 
-if __name__ == "__main__":
-    # start background loop
+# 🔹 new: start the background loop when uvicorn starts (Koyeb path)
+@app.on_event("startup")
+def _start_bg_loop():
     threading.Thread(target=loop_runner, daemon=True).start()
-    # run web server for health check & future endpoints
+
+if __name__ == "__main__":
+    # local dev path (python app.py)
+    threading.Thread(target=loop_runner, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
