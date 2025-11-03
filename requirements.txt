@@ -1,5 +1,7 @@
-ccxt==4.4.47
-pandas==2.2.2
-numpy==1.26.4
-python-dotenv==1.0.1
-Flask
+fastapi
+uvicorn
+ccxt
+requests
+pandas
+numpy
+python-dotenv
