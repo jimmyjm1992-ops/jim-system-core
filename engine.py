@@ -1,6 +1,6 @@
 # engine.py — JIM v5.9.2 radar + trigger scan (single tick)
 
-import os, json, math, time, pathlib
+import os, json, pathlib
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -17,7 +17,7 @@ load_dotenv()
 # --- ENV ---
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").rstrip("/")
 PASS_KEY          = os.getenv("PASS_KEY", "")
-EXCHANGE_NAME     = os.getenv("PRICE_EXCHANGE", "binance")
+EXCHANGE_NAME     = os.getenv("PRICE_EXCHANGE", "mexc")  # <- use mexc to avoid binance 451
 WATCHLIST         = [s.strip() for s in os.getenv("WATCHLIST","BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",") if s.strip()]
 
 # --- EXCHANGE (spot feed only) ---
@@ -28,6 +28,17 @@ def _exchange():
 
 def _mk(symbol):
     return symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
+
+def _ohlcv(kl):
+    df = pd.DataFrame(kl, columns=["ts","open","high","low","close","vol"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df.set_index("ts", inplace=True)
+    for c in ["open","high","low","close","vol"]:
+        df[c] = df[c].astype(float)
+    return df
+
+def fetch_tf(ex, sym, tf="1h", limit=400):
+    return _ohlcv(ex.fetch_ohlcv(_mk(sym), timeframe=tf, limit=limit))
 
 # --- INDICATORS ---
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -49,17 +60,6 @@ def donchian(df, n=55):
     return cap, base
 def macd_slope(series):
     return "up" if series.iloc[-1] > series.iloc[-2] else ("down" if series.iloc[-1] < series.iloc[-2] else "flat")
-
-def _ohlcv(kl):
-    df = pd.DataFrame(kl, columns=["ts","open","high","low","close","vol"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df.set_index("ts", inplace=True)
-    for c in ["open","high","low","close","vol"]:
-        df[c] = df[c].astype(float)
-    return df
-
-def fetch_tf(ex, sym, tf="1h", limit=400):
-    return _ohlcv(ex.fetch_ohlcv(_mk(sym), timeframe=tf, limit=limit))
 
 # --- CORE ANALYZE ---
 def analyze_symbol(ex, symbol):
@@ -90,7 +90,7 @@ def analyze_symbol(ex, symbol):
     note = "no retest setup"
 
     # Long: break + retest at cap (band 0.05–0.30% below cap)
-    if c > cap and d1h.close.iloc[-2] <= cap and trend4h in ("bull") and macd4 in ("up"):
+    if c > cap and d1h.close.iloc[-2] <= cap and trend4h=="bull" and macd4=="up":
         hi = cap * (1 - 0.0005)
         lo = cap * (1 - 0.0030)
         entry_band = (lo, hi)
@@ -99,7 +99,7 @@ def analyze_symbol(ex, symbol):
         note = "1H break + retest band below cap"
 
     # Short: break + retest at base (band 0.05–0.30% above base)
-    if c < base and d1h.close.iloc[-2] >= base and trend4h in ("bear") and macd4 in ("down"):
+    if c < base and d1h.close.iloc[-2] >= base and trend4h=="bear" and macd4=="down":
         lo = base * (1 + 0.0005)
         hi = base * (1 + 0.0030)
         entry_band = (lo, hi)
@@ -147,7 +147,7 @@ def tick_once():
         except Exception as e:
             results.append({"symbol": _mk(sym), "error": str(e)})
 
-    # push signals to Worker -> Telegram
+    # push signals to Worker -> Telegram + Supabase
     if ALERT_WEBHOOK_URL and signals:
         payload = {
             "kind": "signals",
