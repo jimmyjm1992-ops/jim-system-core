@@ -1,33 +1,22 @@
-# engine_loop.py
-import time, os, json, requests
+# engine_loop.py — background loop to call tick_once() forever
+import os, time, traceback
 from engine import tick_once
 
-PASS_KEY = os.getenv("PASS_KEY")  # same key you use in Cloudflare
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-    try:
-        requests.post(url, data=data, timeout=5)
-    except:
-        pass
-
-def run_once():
-    result = tick_once()
-    try:
-        raw = result.get("raw", [])
-        signals = [s for s in raw if s.get("signal") and s.get("signal") != "none"]
-        if len(signals) > 0:
-            msg = f"🚨 JIM Signal Alert\n\n{json.dumps(signals, indent=2)}"
-            send_telegram(msg)
-    except Exception as e:
-        send_telegram(f"⚠️ JIM Error: {e}")
+SLEEP_OK   = int(os.getenv("LOOP_SLEEP_OK", "300"))    # 5 min
+SLEEP_IDLE = int(os.getenv("LOOP_SLEEP_IDLE", "600"))   # 10 min
 
 if __name__ == "__main__":
+    print("[loop] started")
     while True:
-        run_once()
-        time.sleep(60)
+        try:
+            res = tick_once()
+            n = len(res.get("signals", []))
+            print(f"[loop] tick scanned={res.get('scanned')} signals={n}")
+            time.sleep(SLEEP_OK if n>0 else SLEEP_IDLE)
+        except KeyboardInterrupt:
+            print("[loop] stopped by user")
+            break
+        except Exception as e:
+            print("[loop] error:", e)
+            traceback.print_exc()
+            time.sleep(30)
