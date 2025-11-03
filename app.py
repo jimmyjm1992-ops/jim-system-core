@@ -1,27 +1,19 @@
-# app.py
-import os, threading, time
-from flask import Flask, Response
-from engine import main_once  # your existing scan+send routine
+# app.py (confirm these exist)
+from flask import Flask, jsonify
+import threading, time
 
 app = Flask(__name__)
 
+@app.get("/health")
+def health():
+    return jsonify(ok=True, msg="alive")
+
 def run_loop():
-    # run every 15 minutes; adjust as you like
+    # import your engine here and start the background loop
     while True:
-        try:
-            print("[loop] tick")
-            main_once()
-        except Exception as e:
-            print("[loop] error:", e)
-        time.sleep(15 * 60)
-
-# start background loop
-threading.Thread(target=run_loop, daemon=True).start()
-
-@app.get("/")
-def root():
-    return Response("ok", status=200, mimetype="text/plain")
+        # engine.tick()  # your periodic work
+        time.sleep(60)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    threading.Thread(target=run_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=8000)
