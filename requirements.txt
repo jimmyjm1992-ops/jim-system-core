@@ -1,7 +1,8 @@
-fastapi
-uvicorn
-ccxt
-requests
-pandas
-numpy
-python-dotenv
+fastapi==0.115.0
+uvicorn==0.30.6
+pandas==2.2.2
+numpy==1.26.4
+ccxt==4.4.61
+python-dotenv==1.0.1
+httpx==0.27.2
+
