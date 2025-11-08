@@ -1,8 +1,13 @@
 # engine.py — JIM v5.9.2 (global-ready) + JSON-safe outputs
-# Backward compatible with /tick and Worker. Structure unchanged.
+# - Quieter logs via LOG_VERBOSE
+# - Dual timestamps (UTC + Asia/Kuala_Lumpur) in loop prints (used by engine_loop.py)
+# - Safer signal push (only logs success on 2xx)
+# - Tunable OHLC fetch sizes via OHLC_LIMIT_4H / OHLC_LIMIT_1H
 
 import os, json, time, pathlib, math
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import ccxt
@@ -19,19 +24,29 @@ load_dotenv()
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").rstrip("/")
 PASS_KEY          = os.getenv("PASS_KEY", "")
 
+# Logging + fetch sizes
+LOG_VERBOSE     = int(os.getenv("LOG_VERBOSE", "0"))
+OHLC_LIMIT_4H   = int(os.getenv("OHLC_LIMIT_4H", "300"))
+OHLC_LIMIT_1H   = int(os.getenv("OHLC_LIMIT_1H", "400"))
+
 # Global mode controls
-GLOBAL_MODE       = int(os.getenv("GLOBAL", "0"))  # 0=off, 1=on
-EXCHANGES_ENV     = os.getenv("EXCHANGES", "binance,okx,bybit,kraken,coinbase")
-EXCHANGES_LIST    = [e.strip().lower() for e in EXCHANGES_ENV.split(",") if e.strip()]
+GLOBAL_MODE    = int(os.getenv("GLOBAL", "0"))  # 0=off, 1=on
+EXCHANGES_ENV  = os.getenv("EXCHANGES", "binance,okx,kraken,coinbase,mexc")
+EXCHANGES_LIST = [e.strip().lower() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
-# Single-exchange fallback (used if GLOBAL=0, or if no global primary found)
-PRICE_EXCHANGE    = os.getenv("PRICE_EXCHANGE", "mexc").lower()
+# Single-exchange fallback (used if GLOBAL=0, or if global primary not found)
+PRICE_EXCHANGE = os.getenv("PRICE_EXCHANGE", "mexc").lower()
 
-WATCHLIST         = [s.strip() for s in os.getenv(
-    "WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+WATCHLIST = [s.strip() for s in os.getenv(
+    "WATCHLIST",
+    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,LINKUSDT,UNIUSDT,AAVEUSDT,ENAUSDT,TAOUSDT,PENDLEUSDT,VIRTUALUSDT"
 ).split(",") if s.strip()]
 
-# -------- helpers: numbers / exchange / latency --------
+# -------- util/logging --------
+def log(msg: str):
+    if LOG_VERBOSE:
+        print(msg)
+
 def fnum(x):
     """Return a JSON-safe float or None (filters NaN/Inf)."""
     try:
@@ -52,15 +67,13 @@ def timed_fetch_ohlcv(ex, symbol, timeframe="1h", limit=400):
     t0 = time.time()
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     dt_ms = (time.time() - t0) * 1000.0
-    print(f"[LATENCY] {ex.id.upper()} {symbol} {timeframe} x{limit} -> {dt_ms:.2f} ms")
+    log(f"[LATENCY] {ex.id.upper()} {symbol} {timeframe} x{limit} -> {dt_ms:.2f} ms")
     return data
 
 def choose_primary_exchange():
     """
-    GLOBAL_MODE=1:
-      - Try EXCHANGES_LIST in order; return first that works for BTC/USDT.
-    GLOBAL_MODE=0:
-      - Use PRICE_EXCHANGE directly.
+    GLOBAL_MODE=1: try EXCHANGES_LIST in order; return first that supports BTC/USDT.
+    GLOBAL_MODE=0: use PRICE_EXCHANGE directly.
     """
     if not GLOBAL_MODE:
         try:
@@ -103,7 +116,7 @@ def extra_exchanges_for_volume(primary_id: str):
             pass
     return extras
 
-# -------- indicators --------
+# -------- indicators (pandas) --------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def macd(close, fast=12, slow=26, sig=9):
@@ -114,10 +127,10 @@ def macd(close, fast=12, slow=26, sig=9):
 
 def rsi(close, n=14):
     d = close.diff()
-    up = pd.Series(np.where(d>0, d, 0.0), index=close.index).rolling(n).mean()
-    dn = pd.Series(np.where(d<0, -d, 0.0), index=close.index).rolling(n).mean().replace(0, np.nan)
+    up = pd.Series(np.where(d > 0, d, 0.0), index=close.index).rolling(n).mean()
+    dn = pd.Series(np.where(d < 0, -d, 0.0), index=close.index).rolling(n).mean().replace(0, np.nan)
     rs = up / dn
-    out = 100 - (100/(1+rs))
+    out = 100 - (100 / (1 + rs))
     return out.bfill().ffill().fillna(50)
 
 def donchian(df, n=55):
@@ -145,10 +158,10 @@ def fetch_tf(ex, sym, tf="1h", limit=400):
 # -------- core analyze --------
 def analyze_symbol(primary_ex, symbol, vol_extras):
     # price/structure from primary exchange
-    d4h = fetch_tf(primary_ex, symbol, "4h", 300)
-    d1h = fetch_tf(primary_ex, symbol, "1h", 400)
+    d4h = fetch_tf(primary_ex, symbol, "4h", OHLC_LIMIT_4H)
+    d1h = fetch_tf(primary_ex, symbol, "1h", OHLC_LIMIT_1H)
 
-    # optional: aggregate global volume (last bar sum) without changing decisions
+    # optional: aggregate global volume (last 1h bar sum) without changing decisions
     vol_global = float(d1h["vol"].iloc[-1])
     if GLOBAL_MODE and vol_extras:
         for ex in vol_extras:
@@ -156,7 +169,7 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
                 df_ex = fetch_tf(ex, symbol, "1h", 2)  # last 2 bars only (fast)
                 vol_global += float(df_ex["vol"].iloc[-1])
             except Exception as e:
-                print(f"[VOLUME] skip {ex.id} {symbol}: {e}")
+                log(f"[VOLUME] skip {ex.id} {symbol}: {e}")
 
     # indicators
     d4h["ema21"] = ema(d4h.close, 21)
@@ -330,7 +343,10 @@ def tick_once():
         try:
             with httpx.Client(timeout=10.0) as cli:
                 r = cli.post(ALERT_WEBHOOK_URL + "/signals", params={"t": PASS_KEY}, json=payload)
-                print(f"[PUSH] worker /signals -> {r.status_code}")
+                if 200 <= r.status_code < 300:
+                    print(f"[PUSH] worker /signals -> {r.status_code}")
+                else:
+                    print(f"[PUSH] worker ignored (status {r.status_code})")
         except Exception as e:
             print(f"[PUSH] worker error: {e}")
 
@@ -341,3 +357,9 @@ def tick_once():
         "raw": results,
         "note": "v5.9.2 structure+momentum engine active"
     }
+
+# -------- helper for loop timestamps (used by engine_loop.py) --------
+def dual_ts():
+    utc = datetime.now(timezone.utc)
+    kl  = utc.astimezone(ZoneInfo("Asia/Kuala_Lumpur"))
+    return utc.strftime("%Y-%m-%d %H:%M:%S UTC") + " | " + kl.strftime("%Y-%m-%d %H:%M:%S KL")
