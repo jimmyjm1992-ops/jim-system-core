@@ -1,6 +1,6 @@
 # engine.py — JIM v5.9.2 (global-ready) + JSON-safe outputs
 # - Quieter logs via LOG_VERBOSE
-# - Dual timestamps (UTC + Asia/Kuala_Lumpur) in loop prints (used by engine_loop.py)
+# - Dual timestamps (UTC + Asia/Kuala_Lumpur) via dual_ts()
 # - Safer signal push (only logs success on 2xx)
 # - Tunable OHLC fetch sizes via OHLC_LIMIT_4H / OHLC_LIMIT_1H
 
