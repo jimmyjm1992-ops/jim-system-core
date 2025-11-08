@@ -1,8 +1,10 @@
+# engine_loop.py — background loop w/ dual timestamps (UTC | KL)
 import os, time, traceback
 from engine import tick_once, dual_ts
 
+# keep the engine warm; both paths = 300s
 SLEEP_OK   = int(os.getenv("LOOP_SLEEP_OK", "300"))   # 5 min
-SLEEP_IDLE = int(os.getenv("LOOP_SLEEP_IDLE", "600")) # 10 min
+SLEEP_IDLE = int(os.getenv("LOOP_SLEEP_IDLE", "300")) # 5 min
 
 if __name__ == "__main__":
     print("[loop] started")
