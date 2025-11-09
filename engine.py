@@ -325,14 +325,34 @@ def tick_once():
             row = analyze_symbol(primary, sym, volume_extras)
             results.append(row)
             if row["signal"] in ("LONG", "SHORT"):
+                # --- compute entry_mid + SL (so Worker can pass GO/WAIT gate) ---
+                entry = list(row["entry_zone"]) if row["entry_zone"] else None
+                entry_mid = None
+                sl = None
+                if entry and entry[0] is not None and entry[1] is not None:
+                    entry_mid = (entry[0] + entry[1]) / 2.0
+                    if row["sl_max_pct"] is not None:
+                        if row["signal"] == "LONG":
+                            sl = entry_mid * (1.0 - float(row["sl_max_pct"]))
+                        else:
+                            sl = entry_mid * (1.0 + float(row["sl_max_pct"]))
+
                 signals.append({
                     "symbol": row["symbol"],
                     "side": row["signal"],
-                    "entry": list(row["entry_zone"]) if row["entry_zone"] else None,
-                    "sl": None,
+                    "tf": "1h",
+                    "price": row["price"],
+                    "entry": entry,
+                    "entry_mid": fnum(entry_mid),
+                    "sl": fnum(sl),
                     "tp1": None, "tp2": None, "tp3": None,
                     "sl_max_pct": row["sl_max_pct"],
-                    "note": row["note"]
+                    "note": row["note"],
+                    # Optional telemetry (Worker will ignore unknown fields)
+                    "macd_slope": row["why"]["metrics"]["macd4_slope"],
+                    "rsi": row["why"]["bias"]["rsi"],
+                    "atr1h_pct": row["why"]["metrics"]["atr1h_pct"],
+                    "body_break_pct": row["why"]["metrics"]["body_break_pct"]
                 })
         except Exception as e:
             results.append({"symbol": _mk(sym), "error": str(e)})
@@ -342,13 +362,15 @@ def tick_once():
         payload = {"pass": PASS_KEY, "summary": f"{len(signals)} signal(s) from JIM engine", "signals": signals}
         try:
             with httpx.Client(timeout=10.0) as cli:
-                r = cli.post(ALERT_WEBHOOK_URL + "/signals", params={"t": PASS_KEY}, json=payload)
+                url = ALERT_WEBHOOK_URL.rstrip("/") + "/signals"
+                r = cli.post(url, params={"t": PASS_KEY}, json=payload)
                 if 200 <= r.status_code < 300:
-                    print(f"[PUSH] worker /signals -> {r.status_code}")
+                    print(f"[PUSH] {url} -> {r.status_code}")
                 else:
-                    print(f"[PUSH] worker ignored (status {r.status_code})")
+                    body_preview = (r.text or "")[:200]
+                    print(f"[PUSH] FAIL {url} -> {r.status_code} {body_preview}")
         except Exception as e:
-            print(f"[PUSH] worker error: {e}")
+            print(f"[PUSH] error to {ALERT_WEBHOOK_URL}: {e}")
 
     return {
         "engine": "jim_v5.9.2",
