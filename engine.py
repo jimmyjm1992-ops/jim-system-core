@@ -1,7 +1,7 @@
 # engine.py — JIM v5.9.3 (global-ready) + JSON-safe outputs
-# - Adds Tier-2 momentum entries (continuation after clean break)
-# - Tier labels in notes: "Tier: T1_SNIPER ..." or "Tier: T2_MOMENTUM ..."
-# - Payload stable; adds helper fields for executors (sl_from_mid, sl_pct)
+# - Tier-1 (break+retest) and Tier-2 (momentum continuation)
+# - Contract-safe push: POST ALERT_WEBHOOK_URL?t=PASS_KEY with body {summary, signals}
+# - No extra headers, no extra /signals suffix, no "pass" in JSON
 # - Quieter logs via LOG_VERBOSE; dual_ts(); tunable OHLC limits
 
 import os, json, time, pathlib, math
@@ -14,7 +14,8 @@ import ccxt
 import httpx
 from dotenv import load_dotenv
 
-ROOT = pathlib.Path(__file__).parent
+# -------- FS roots (use correct dunder) --------
+ROOT = pathlib.Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 
@@ -39,7 +40,9 @@ PRICE_EXCHANGE = os.getenv("PRICE_EXCHANGE", "mexc").lower()
 
 WATCHLIST = [s.strip() for s in os.getenv(
     "WATCHLIST",
-    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,LINKUSDT,UNIUSDT,AAVEUSDT,ENAUSDT,TAOUSDT,PENDLEUSDT,VIRTUALUSDT,HBARUSDT,BCHUSDT,AVAXUSDT,LTCUSDT,DOTUSDT,SUIUSDT,NEARUSDT,OPUSDT,ARBUSDT,APTUSDT,ATOMUSDT,ALGOUSDT,INJUSDT,MATICUSDT,FTMUSDT,GALAUSDT,XLMUSDT,HYPEUSDT"
+    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,LINKUSDT,UNIUSDT,AAVEUSDT,ENAUSDT,TAOUSDT,"
+    "PENDLEUSDT,VIRTUALUSDT,HBARUSDT,BCHUSDT,AVAXUSDT,LTCUSDT,DOTUSDT,SUIUSDT,NEARUSDT,"
+    "OPUSDT,ARBUSDT,APTUSDT,ATOMUSDT,ALGOUSDT,INJUSDT,MATICUSDT,FTMUSDT,GALAUSDT,XLMUSDT,HYPEUSDT"
 ).split(",") if s.strip()]
 
 # -------- util/logging --------
@@ -257,23 +260,20 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
         note = "Tier: T1_SNIPER · 1H break + retest band above base"
 
     # -------- Tier-2: Momentum continuation (conservative defaults) --------
-    # Only if no T1 signal. Goal: catch continuation after clean break, with guardrails.
     if signal == "none":
         rsi_now = float(d1h["rsi"].iloc[-1])
-        # safe windows
         atr_ok  = (atr1h_pct >= 0.5) and (atr1h_pct <= 2.0)
         body_ok = False
         body_break_pct = 0.0
         if c > cap:
             body_break_pct = (c - cap) / cap * 100.0
-            body_ok = body_break_pct >= 0.25 and body_break_pct <= 1.20
+            body_ok = 0.25 <= body_break_pct <= 1.20
         elif c < base:
             body_break_pct = (base - c) / base * 100.0
-            body_ok = body_break_pct >= 0.25 and body_break_pct <= 1.20
+            body_ok = 0.25 <= body_break_pct <= 1.20
 
         # Long continuation
         if c > cap and trend4h == "bull" and macd4 == "up" and 48 <= rsi_now <= 68 and atr_ok and body_ok:
-            # micro pullback band around current price (tighter than T1)
             hi = c * (1 - 0.0008)
             lo = c * (1 - 0.0035)
             entry_band = (lo, hi)
@@ -336,38 +336,27 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
     }
     return out
 
-# -------- webhook helpers (robust) --------
-def _urls_to_try():
-    base = ALERT_WEBHOOK_URL.rstrip('/')
-    return [base, f"{base}/signals"] if not base.endswith('/signals') else [base]
-
+# -------- push (strict contract with your Worker) --------
 def push_signals(signals: list):
-    """Send signals array to Worker with retries and dual auth (header + query)."""
+    """Send to ALERT_WEBHOOK_URL exactly as configured, auth via ?t=PASS_KEY, body {summary, signals}."""
     if not ALERT_WEBHOOK_URL or not signals:
         return
+    url = ALERT_WEBHOOK_URL  # DO NOT append paths here
+    params = {"t": PASS_KEY} if PASS_KEY else None
     payload = {
-        "pass": PASS_KEY,
         "summary": f"{len(signals)} signal(s) from JIM engine",
         "signals": signals
     }
     try:
         with httpx.Client(timeout=10.0) as cli:
-            last = None
-            for url in _urls_to_try():
-                r = cli.post(
-                    url,
-                    params={"t": PASS_KEY},                 # query auth (legacy)
-                    headers={"X-PASS-KEY": PASS_KEY},       # header auth (alt)
-                    json=payload,
-                )
-                last = r
-                ok = 200 <= r.status_code < 300
-                print(f"[PUSH] {'OK' if ok else 'FAIL'} {url} -> {r.status_code} {(r.text or '')[:200]}")
-                if ok:
-                    break
-            # if both failed, last print above shows reason body (first 200 chars)
+            r = cli.post(url, params=params, json=payload)
+            if 200 <= r.status_code < 300:
+                print(f"[PUSH] {url} -> {r.status_code}")
+            else:
+                body_preview = (r.text or "")[:200]
+                print(f"[PUSH] FAIL {url} -> {r.status_code} {body_preview}")
     except Exception as e:
-        print(f"[PUSH] EXC {_urls_to_try()[0]} -> {e}")
+        print(f"[PUSH] error to {ALERT_WEBHOOK_URL}: {e}")
 
 # -------- tick_once (one scan + optional push) --------
 def tick_once():
@@ -410,10 +399,8 @@ def tick_once():
                     "price": row["price"],
                     "entry": entry,
                     "entry_mid": fnum(entry_mid),
-                    # Provide both: mid-based SL (legacy) and % for client to compute from actual fill
-                    "sl": fnum(sl_from_mid),
-                    "sl_from_mid": fnum(sl_from_mid),
-                    "sl_pct": fnum(row["sl_max_pct"]),  # e.g., 0.012 → client does fill*(1±0.012)
+                    "sl": fnum(sl_from_mid),          # legacy mid-based SL
+                    "sl_pct": fnum(row["sl_max_pct"]),# client can compute from actual fill
                     "tp1": None, "tp2": None, "tp3": None,
                     "sl_max_pct": row["sl_max_pct"],
                     "note": row["note"],
@@ -426,7 +413,6 @@ def tick_once():
         except Exception as e:
             results.append({"symbol": _mk(sym), "error": str(e)})
 
-    # Optional push to Worker
     if ALERT_WEBHOOK_URL and signals:
         push_signals(signals)
 
