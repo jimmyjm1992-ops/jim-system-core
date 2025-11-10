@@ -1,8 +1,8 @@
-# engine.py — JIM v5.9.2 (global-ready) + JSON-safe outputs
-# - Quieter logs via LOG_VERBOSE
-# - Dual timestamps (UTC + Asia/Kuala_Lumpur) via dual_ts()
-# - Safer signal push (only logs success on 2xx)
-# - Tunable OHLC fetch sizes via OHLC_LIMIT_4H / OHLC_LIMIT_1H
+# engine.py — JIM v5.9.3 (global-ready) + JSON-safe outputs
+# - Adds Tier-2 momentum entries (continuation after clean break)
+# - Tier labels in notes: "Tier: T1_SNIPER ..." or "Tier: T2_MOMENTUM ..."
+# - Keeps payload shape identical; no new env required
+# - Quieter logs via LOG_VERBOSE; dual_ts(); tunable OHLC limits
 
 import os, json, time, pathlib, math
 from datetime import datetime, timezone
@@ -14,7 +14,7 @@ import ccxt
 import httpx
 from dotenv import load_dotenv
 
-ROOT = pathlib.Path(__file__).parent
+ROOT = pathlib.Path(_file_).parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 
@@ -239,14 +239,14 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
     sl_max_pct = None
     note = "no retest setup"
 
-    # Break + Retest logic (unchanged)
+    # -------- Tier-1: Break + Retest (original) --------
     if c > cap and d1h.close.iloc[-2] <= cap and trend4h == "bull" and macd4 == "up":
         hi = cap * (1 - 0.0005)
         lo = cap * (1 - 0.0030)
         entry_band = (lo, hi)
         sl_max_pct = 0.012
         signal = "LONG"
-        note = "1H break + retest band below cap"
+        note = "Tier: T1_SNIPER · 1H break + retest band below cap"
 
     if c < base and d1h.close.iloc[-2] >= base and trend4h == "bear" and macd4 == "down":
         lo = base * (1 + 0.0005)
@@ -254,7 +254,41 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
         entry_band = (lo, hi)
         sl_max_pct = 0.012
         signal = "SHORT"
-        note = "1H break + retest band above base"
+        note = "Tier: T1_SNIPER · 1H break + retest band above base"
+
+    # -------- Tier-2: Momentum continuation (conservative defaults) --------
+    # Only if no T1 signal. Goal: catch continuation after clean break, with guardrails.
+    if signal == "none":
+        rsi_now = float(d1h["rsi"].iloc[-1])
+        # safe windows
+        atr_ok  = (atr1h_pct >= 0.5) and (atr1h_pct <= 2.0)
+        body_ok = False
+        body_break_pct = 0.0
+        if c > cap:
+            body_break_pct = (c - cap) / cap * 100.0
+            body_ok = body_break_pct >= 0.25 and body_break_pct <= 1.20
+        elif c < base:
+            body_break_pct = (base - c) / base * 100.0
+            body_ok = body_break_pct >= 0.25 and body_break_pct <= 1.20
+
+        # Long continuation
+        if c > cap and trend4h == "bull" and macd4 == "up" and 48 <= rsi_now <= 68 and atr_ok and body_ok:
+            # micro pullback band around current price (tighter than T1)
+            hi = c * (1 - 0.0008)
+            lo = c * (1 - 0.0035)
+            entry_band = (lo, hi)
+            sl_max_pct = 0.012
+            signal = "LONG"
+            note = "Tier: T2_MOMENTUM · post-break continuation band (tight pullback)"
+
+        # Short continuation
+        if c < base and trend4h == "bear" and macd4 == "down" and 32 <= rsi_now <= 55 and atr_ok and body_ok:
+            lo = c * (1 + 0.0008)
+            hi = c * (1 + 0.0035)
+            entry_band = (lo, hi)
+            sl_max_pct = 0.012
+            signal = "SHORT"
+            note = "Tier: T2_MOMENTUM · post-break continuation band (tight pullback)"
 
     # momentum diagnostics
     mom_long  = int(d1h.ema21.iloc[-1] > d1h.ema50.iloc[-1]) + int(d1h.rsi.iloc[-1] > 50)
@@ -308,7 +342,7 @@ def tick_once():
         primary = choose_primary_exchange()
     except Exception as e:
         return {
-            "engine": "jim_v5.9.2",
+            "engine": "jim_v5.9.3",
             "scanned": 0,
             "signals": [],
             "raw": [{"error": f"exchange init failed: {e}"}],
@@ -373,11 +407,11 @@ def tick_once():
             print(f"[PUSH] error to {ALERT_WEBHOOK_URL}: {e}")
 
     return {
-        "engine": "jim_v5.9.2",
+        "engine": "jim_v5.9.3",
         "scanned": len(WATCHLIST),
         "signals": signals,
         "raw": results,
-        "note": "v5.9.2 structure+momentum engine active"
+        "note": "v5.9.3 T1+T2 engine active"
     }
 
 # -------- helper for loop timestamps (used by engine_loop.py) --------
