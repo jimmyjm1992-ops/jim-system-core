@@ -336,13 +336,13 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
     }
     return out
 
-# -------- webhook helpers --------
-def _signals_url():
+# -------- webhook helpers (robust) --------
+def _urls_to_try():
     base = ALERT_WEBHOOK_URL.rstrip('/')
-    return base if base.endswith('/signals') else f"{base}/signals"
+    return [base, f"{base}/signals"] if not base.endswith('/signals') else [base]
 
 def push_signals(signals: list):
-    """Send signals array to Worker. Backward-compatible payload."""
+    """Send signals array to Worker with retries and dual auth (header + query)."""
     if not ALERT_WEBHOOK_URL or not signals:
         return
     payload = {
@@ -352,13 +352,22 @@ def push_signals(signals: list):
     }
     try:
         with httpx.Client(timeout=10.0) as cli:
-            url = _signals_url()
-            # Keep old 't' param for workers relying on query validation
-            r = cli.post(url, params={"t": PASS_KEY}, json=payload)
-            ok = 200 <= r.status_code < 300
-            print(f"[PUSH] {'OK' if ok else 'FAIL'} {url} -> {r.status_code} {(r.text or '')[:200]}")
+            last = None
+            for url in _urls_to_try():
+                r = cli.post(
+                    url,
+                    params={"t": PASS_KEY},                 # query auth (legacy)
+                    headers={"X-PASS-KEY": PASS_KEY},       # header auth (alt)
+                    json=payload,
+                )
+                last = r
+                ok = 200 <= r.status_code < 300
+                print(f"[PUSH] {'OK' if ok else 'FAIL'} {url} -> {r.status_code} {(r.text or '')[:200]}")
+                if ok:
+                    break
+            # if both failed, last print above shows reason body (first 200 chars)
     except Exception as e:
-        print(f"[PUSH] EXC {_signals_url()} -> {e}")
+        print(f"[PUSH] EXC {_urls_to_try()[0]} -> {e}")
 
 # -------- tick_once (one scan + optional push) --------
 def tick_once():
