@@ -14,7 +14,7 @@ import ccxt
 import httpx
 from dotenv import load_dotenv
 
-ROOT = pathlib.Path(_file_).parent
+ROOT = pathlib.Path(__file__).parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 
