@@ -1,7 +1,7 @@
 # engine.py — JIM v5.9.3 (global-ready) + JSON-safe outputs
 # - Tier-1 (break+retest) and Tier-2 (momentum continuation)
-# - Contract-safe push: POST ALERT_WEBHOOK_URL?t=PASS_KEY with body {summary, signals}
-# - No extra headers, no extra /signals suffix, no "pass" in JSON
+# - Contract with Worker: POST {ALERT_WEBHOOK_URL}/signals?t=PASS_KEY  body={summary, signals}
+# - No extra headers; no 'pass' field in JSON body
 # - Quieter logs via LOG_VERBOSE; dual_ts(); tunable OHLC limits
 
 import os, json, time, pathlib, math
@@ -14,7 +14,7 @@ import ccxt
 import httpx
 from dotenv import load_dotenv
 
-# -------- FS roots (use correct dunder) --------
+# -------- FS roots (dunder correct) --------
 ROOT = pathlib.Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
@@ -336,27 +336,27 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
     }
     return out
 
-# -------- push (strict contract with your Worker) --------
+# -------- push (conforms to your Worker) --------
+def _signals_url():
+    base = ALERT_WEBHOOK_URL.rstrip('/')
+    return base if base.endswith('/signals') else f"{base}/signals"
+
 def push_signals(signals: list):
-    """Send to ALERT_WEBHOOK_URL exactly as configured, auth via ?t=PASS_KEY, body {summary, signals}."""
+    """Send to Worker: POST {ALERT_WEBHOOK_URL}/signals?t=PASS_KEY  body={summary,signals}"""
     if not ALERT_WEBHOOK_URL or not signals:
         return
-    url = ALERT_WEBHOOK_URL  # DO NOT append paths here
+    url = _signals_url()
     params = {"t": PASS_KEY} if PASS_KEY else None
-    payload = {
-        "summary": f"{len(signals)} signal(s) from JIM engine",
-        "signals": signals
-    }
+    payload = {"summary": f"{len(signals)} signal(s) from JIM engine", "signals": signals}
     try:
         with httpx.Client(timeout=10.0) as cli:
             r = cli.post(url, params=params, json=payload)
             if 200 <= r.status_code < 300:
                 print(f"[PUSH] {url} -> {r.status_code}")
             else:
-                body_preview = (r.text or "")[:200]
-                print(f"[PUSH] FAIL {url} -> {r.status_code} {body_preview}")
+                print(f"[PUSH] FAIL {url} -> {r.status_code} {(r.text or '')[:200]}")
     except Exception as e:
-        print(f"[PUSH] error to {ALERT_WEBHOOK_URL}: {e}")
+        print(f"[PUSH] EXC {_signals_url()} -> {e}")
 
 # -------- tick_once (one scan + optional push) --------
 def tick_once():
@@ -399,8 +399,8 @@ def tick_once():
                     "price": row["price"],
                     "entry": entry,
                     "entry_mid": fnum(entry_mid),
-                    "sl": fnum(sl_from_mid),          # legacy mid-based SL
-                    "sl_pct": fnum(row["sl_max_pct"]),# client can compute from actual fill
+                    "sl": fnum(sl_from_mid),           # mid-based SL for legacy client calc
+                    "sl_pct": fnum(row["sl_max_pct"]), # client may recalc from actual fill
                     "tp1": None, "tp2": None, "tp3": None,
                     "sl_max_pct": row["sl_max_pct"],
                     "note": row["note"],
