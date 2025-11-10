@@ -1,7 +1,7 @@
 # engine.py — JIM v5.9.3 (global-ready) + JSON-safe outputs
 # - Adds Tier-2 momentum entries (continuation after clean break)
 # - Tier labels in notes: "Tier: T1_SNIPER ..." or "Tier: T2_MOMENTUM ..."
-# - Keeps payload shape identical; no new env required
+# - Payload stable; adds helper fields for executors (sl_from_mid, sl_pct)
 # - Quieter logs via LOG_VERBOSE; dual_ts(); tunable OHLC limits
 
 import os, json, time, pathlib, math
@@ -336,6 +336,30 @@ def analyze_symbol(primary_ex, symbol, vol_extras):
     }
     return out
 
+# -------- webhook helpers --------
+def _signals_url():
+    base = ALERT_WEBHOOK_URL.rstrip('/')
+    return base if base.endswith('/signals') else f"{base}/signals"
+
+def push_signals(signals: list):
+    """Send signals array to Worker. Backward-compatible payload."""
+    if not ALERT_WEBHOOK_URL or not signals:
+        return
+    payload = {
+        "pass": PASS_KEY,
+        "summary": f"{len(signals)} signal(s) from JIM engine",
+        "signals": signals
+    }
+    try:
+        with httpx.Client(timeout=10.0) as cli:
+            url = _signals_url()
+            # Keep old 't' param for workers relying on query validation
+            r = cli.post(url, params={"t": PASS_KEY}, json=payload)
+            ok = 200 <= r.status_code < 300
+            print(f"[PUSH] {'OK' if ok else 'FAIL'} {url} -> {r.status_code} {(r.text or '')[:200]}")
+    except Exception as e:
+        print(f"[PUSH] EXC {_signals_url()} -> {e}")
+
 # -------- tick_once (one scan + optional push) --------
 def tick_once():
     try:
@@ -359,17 +383,16 @@ def tick_once():
             row = analyze_symbol(primary, sym, volume_extras)
             results.append(row)
             if row["signal"] in ("LONG", "SHORT"):
-                # --- compute entry_mid + SL (so Worker can pass GO/WAIT gate) ---
                 entry = list(row["entry_zone"]) if row["entry_zone"] else None
                 entry_mid = None
-                sl = None
+                sl_from_mid = None
                 if entry and entry[0] is not None and entry[1] is not None:
                     entry_mid = (entry[0] + entry[1]) / 2.0
                     if row["sl_max_pct"] is not None:
                         if row["signal"] == "LONG":
-                            sl = entry_mid * (1.0 - float(row["sl_max_pct"]))
+                            sl_from_mid = entry_mid * (1.0 - float(row["sl_max_pct"]))
                         else:
-                            sl = entry_mid * (1.0 + float(row["sl_max_pct"]))
+                            sl_from_mid = entry_mid * (1.0 + float(row["sl_max_pct"]))
 
                 signals.append({
                     "symbol": row["symbol"],
@@ -378,11 +401,14 @@ def tick_once():
                     "price": row["price"],
                     "entry": entry,
                     "entry_mid": fnum(entry_mid),
-                    "sl": fnum(sl),
+                    # Provide both: mid-based SL (legacy) and % for client to compute from actual fill
+                    "sl": fnum(sl_from_mid),
+                    "sl_from_mid": fnum(sl_from_mid),
+                    "sl_pct": fnum(row["sl_max_pct"]),  # e.g., 0.012 → client does fill*(1±0.012)
                     "tp1": None, "tp2": None, "tp3": None,
                     "sl_max_pct": row["sl_max_pct"],
                     "note": row["note"],
-                    # Optional telemetry (Worker will ignore unknown fields)
+                    # Telemetry (safe to ignore by Worker)
                     "macd_slope": row["why"]["metrics"]["macd4_slope"],
                     "rsi": row["why"]["bias"]["rsi"],
                     "atr1h_pct": row["why"]["metrics"]["atr1h_pct"],
@@ -391,20 +417,9 @@ def tick_once():
         except Exception as e:
             results.append({"symbol": _mk(sym), "error": str(e)})
 
-    # Optional push to Worker (/signals)
+    # Optional push to Worker
     if ALERT_WEBHOOK_URL and signals:
-        payload = {"pass": PASS_KEY, "summary": f"{len(signals)} signal(s) from JIM engine", "signals": signals}
-        try:
-            with httpx.Client(timeout=10.0) as cli:
-                url = ALERT_WEBHOOK_URL.rstrip("/") + "/signals"
-                r = cli.post(url, params={"t": PASS_KEY}, json=payload)
-                if 200 <= r.status_code < 300:
-                    print(f"[PUSH] {url} -> {r.status_code}")
-                else:
-                    body_preview = (r.text or "")[:200]
-                    print(f"[PUSH] FAIL {url} -> {r.status_code} {body_preview}")
-        except Exception as e:
-            print(f"[PUSH] error to {ALERT_WEBHOOK_URL}: {e}")
+        push_signals(signals)
 
     return {
         "engine": "jim_v5.9.3",
@@ -413,25 +428,6 @@ def tick_once():
         "raw": results,
         "note": "v5.9.3 T1+T2 engine active"
     }
-# --- in engine.py (near your push/send function) ---
-def _signals_url():
-    base = ALERT_WEBHOOK_URL.rstrip('/')
-    # Append /signals only if it's not already present
-    return base if base.endswith('/signals') else f"{base}/signals"
-
-def push_signal(payload: dict) -> tuple[int, str]:
-    if not ALERT_WEBHOOK_URL:
-        return 0, "ALERT_WEBHOOK_URL empty"
-    try:
-        with httpx.Client(timeout=10) as c:
-            r = c.post(_signals_url(), json=payload, headers={"X-PASS-KEY": PASS_KEY})
-        ok = 200 <= r.status_code < 300
-        # Log only summary; body truncated for safety
-        print(f"[PUSH] {'OK' if ok else 'FAIL'} {_signals_url()} -> {r.status_code} {r.text[:200]}")
-        return r.status_code, r.text
-    except Exception as e:
-        print(f"[PUSH] EXC {_signals_url()} -> {e}")
-        return -1, str(e)
 
 # -------- helper for loop timestamps (used by engine_loop.py) --------
 def dual_ts():
