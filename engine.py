@@ -14,7 +14,7 @@ import ccxt
 import httpx
 from dotenv import load_dotenv
 
-ROOT = pathlib.Path(__file__).parent
+ROOT = pathlib.Path(_file_).parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 
@@ -413,6 +413,25 @@ def tick_once():
         "raw": results,
         "note": "v5.9.3 T1+T2 engine active"
     }
+# --- in engine.py (near your push/send function) ---
+def _signals_url():
+    base = ALERT_WEBHOOK_URL.rstrip('/')
+    # Append /signals only if it's not already present
+    return base if base.endswith('/signals') else f"{base}/signals"
+
+def push_signal(payload: dict) -> tuple[int, str]:
+    if not ALERT_WEBHOOK_URL:
+        return 0, "ALERT_WEBHOOK_URL empty"
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.post(_signals_url(), json=payload, headers={"X-PASS-KEY": PASS_KEY})
+        ok = 200 <= r.status_code < 300
+        # Log only summary; body truncated for safety
+        print(f"[PUSH] {'OK' if ok else 'FAIL'} {_signals_url()} -> {r.status_code} {r.text[:200]}")
+        return r.status_code, r.text
+    except Exception as e:
+        print(f"[PUSH] EXC {_signals_url()} -> {e}")
+        return -1, str(e)
 
 # -------- helper for loop timestamps (used by engine_loop.py) --------
 def dual_ts():
