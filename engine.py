@@ -431,72 +431,77 @@ def tier2_sr_bounce(symbol, d4, d1, swings4, trend4, trend1, regime):
     return None
 
 
-def tier3_pattern(symbol, d1, swings1, trend4, regime):
+def tier3_pattern(c, df1, swings):
     """
-    T3: Simple double bottom / double top pattern near local S/R.
-    Only used when T1 & T2 not present.
+    Tier 3 — Bernard-style pattern trades
+    - Only trade patterns when MOMENTUM agrees
+    - Reject "naked" double tops/bottoms that fight MACD / RSI
     """
-    if len(swings1) < 4:
-        return None
 
-    closes = d1.close
-    idxs = [i for (i, _, _) in swings1]
-    # keep last few swing points
-    idxs = idxs[-5:]
+    closes = df1["close"]
+    last   = float(closes.iloc[-1])
 
-    # We look at last 3 swings: A, B, C
-    if len(idxs) < 3:
-        return None
+    # Need enough swings to talk about a pattern
+    if len(swings) < 3:
+        return (None, None, None)
 
-    a, b, c = idxs[-3], idxs[-2], idxs[-1]
-    pa = closes.iloc[a]
-    pb = closes.iloc[b]
-    pc = closes.iloc[c]
+    # --- 1H momentum filters (Bernard-style) ---
+    # We already have df1.rsi from earlier in analyze_symbol
+    try:
+        r = float(df1["rsi"].iloc[-1])
+    except Exception:
+        # if for some reason rsi missing, skip Tier 3
+        return (None, None, None)
 
-    last = d1.iloc[-1]
+    macd_line, macd_sig, _ = macd(df1["close"])
+    macd1 = macd_slope(macd_line)
 
-    # Double bottom: A (low), B (low), price now breaking upwards
-    # Only if BTC not risk_off and 4H trend is up
-    if regime != "risk_off" and trend4 == "up":
-        # approx equal lows
-        if abs(pa - pb) / pa * 100 <= 0.5 and pc > pb:
-            # Last candle bullish and above both lows
-            if last["close"] > last["open"] and last["close"] > max(pa, pb):
-                base_level = (pa + pb) / 2.0
-                entry_low = max(base_level, last["open"])
-                entry_high = last["close"] * 1.001
-                entry_mid = (entry_low + entry_high) / 2.0
-                sl_price = min(last["low"], base_level * 0.997)
-                price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
-                if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                    return {
-                        "side": "LONG",
-                        "entry_low": entry_low,
-                        "entry_high": entry_high,
-                        "sl": sl_price,
-                        "note": f"T3_PATTERN · Double Bottom near {base_level:.4f}"
-                    }
+    # we only care about the last few swings
+    idx = [p[0] for p in swings[-4:]]
+    if len(idx) < 3:
+        return (None, None, None)
 
-    # Double top: A (high), B (high), now breaking down
-    if trend4 == "down":
-        if abs(pa - pb) / pa * 100 <= 0.5 and pc < pb:
-            if last["close"] < last["open"] and last["close"] < min(pa, pb):
-                top_level = (pa + pb) / 2.0
-                entry_high = min(top_level, last["open"])
-                entry_low = last["close"] * 0.999
-                entry_mid = (entry_low + entry_high) / 2.0
-                sl_price = max(last["high"], top_level * 1.003)
-                price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
-                if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                    return {
-                        "side": "SHORT",
-                        "entry_low": entry_low,
-                        "entry_high": entry_high,
-                        "sl": sl_price,
-                        "note": f"T3_PATTERN · Double Top near {top_level:.4f}"
-                    }
+    a, b, c_i = idx[-3], idx[-2], idx[-1]
+    pa, pb    = float(closes.iloc[a]), float(closes.iloc[b])
 
-    return None
+    # Swings must be close in price (true "double" structure)
+    # allow up to ~0.4% difference
+    if abs(pa - pb) / pa * 100.0 > 0.4:
+        return (None, None, None)
+
+    # ---------- DOUBLE BOTTOM (LONG) ----------
+    # Conditions:
+    #  - MACD slope up (momentum building up)
+    #  - RSI not oversold breakdown (>= 44) and not overheated (<= 68)
+    #  - Latest price above the swing lows (bounce confirmed)
+    if (
+        macd1 == "up"
+        and 44.0 <= r <= 68.0
+        and last > pb
+    ):
+        lo = min(pa, pb) * 0.995   # SL zone ~0.5% below lows
+        hi = last * 0.999          # entry just under current price
+        note = f"T3_PATTERN · Double Bottom near {pb:.4f}"
+        return ("LONG", (lo, hi), note)
+
+    # ---------- DOUBLE TOP (SHORT) ----------
+    # Conditions:
+    #  - MACD slope down (momentum turning down)
+    #  - RSI not exhausted down (>= 32) and not too strong up (<= 56)
+    #    -> this is where FLM should be REJECTED (RSI = 60)
+    #  - Latest price below the swing highs (roll-over confirmed)
+    if (
+        macd1 == "down"
+        and 32.0 <= r <= 56.0
+        and last < pb
+    ):
+        hi  = max(pa, pb) * 1.005  # SL zone ~0.5% above highs
+        lo  = last * 1.001         # entry just below current price
+        note = f"T3_PATTERN · Double Top near {pb:.4f}"
+        return ("SHORT", (lo, hi), note)
+
+    # If momentum does not agree, NO Tier-3 trade
+    return (None, None, None)
 
 
 # ---------- Symbol Analysis ----------
