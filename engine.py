@@ -810,8 +810,11 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         return (a, b, pa, pb)
 
     # ----- LONG: support bounce / double bottom / SFP low -----
-    if regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
+    # Bernard rule: NO counter-trend longs in 4H downtrend
+    if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
+
+            # Must have rejection OR double bottom OR SFP
             dbl = detect_double(swings1, "bottom")
             sfp_ok = detect_sfp_low(d1, swings1)
             if (
@@ -821,15 +824,27 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
             ):
                 return None
 
+            # 1H structure must NOT be making LL (must be HL or flat)
+            struct1h = swing_structure_1h(d1["close"], look=2)
+            if struct1h["low_trend"] == "down":
+                return None
+
+            # EMA reclaim confirmation (Bernard bounce strength)
+            ema21_1h = float(d1["ema21"].iloc[-1])
+            ema50_1h = float(d1["ema50"].iloc[-1])
+            if not (last["close"] >= ema21_1h and ema21_1h >= ema50_1h * 0.995):
+                return None
+
+            # MACD/RSI bounce confirmation
+            if not (macd1_dir == "up" and macd_val > 0 and 40 <= rsi1 <= 65):
+                return None
+
             note_core = f"B3_SR_BOUNCE · {sup_touch}x support @ {sup_level:.4f}"
             if dbl:
                 _, _, _, pb = dbl
                 note_core = f"B3_PATTERN · Double Bottom near {pb:.4f}"
             if sfp_ok:
                 note_core += " · SFP_low"
-
-            if not (30 <= rsi1 <= 70 and macd1_dir in ("up", "flat")):
-                return None
 
             entry_low = min(last["low"], sup_level)
             entry_high = max(last["close"], sup_level * 1.001)
@@ -844,6 +859,7 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                     "sl": sl_price,
                     "note": note_core,
                 }
+
 
     # ----- SHORT: resistance rejection / double top / SFP high -----
     if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7:
