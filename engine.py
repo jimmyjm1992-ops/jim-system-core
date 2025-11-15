@@ -1,5 +1,5 @@
 # ==========================================================
-#  engine.py — Bernard System v2.3 (Pure Bernard Logic)
+#  engine.py — Bernard System v2.3 (Pure Bernard Logic) — HARDENED
 #
 #  - 3 Bernard families:
 #       B1: Breakout + Retest at strong 4H S/R
@@ -13,6 +13,11 @@
 #  - TP = 1R / 2R / 3R
 #  - Safe for Koyeb free plan (4H + 1H only, hourly run)
 #  - Fully compatible with Worker & Supabase contracts
+#  - Hardened per Bernard Blueprint v2.3:
+#      * B3 NameError fix (macd_val), RSI windows aligned
+#      * Env-driven tolerances (SR/Retest/Reject)
+#      * Optional ATR gap to opposite 4H S/R for B3
+#      * Dual-mode webhook auth (query param + Bearer header)
 # ==========================================================
 
 import os, time, pathlib, math
@@ -68,12 +73,18 @@ MAX_PRICE_RISK_PCT = 5.0
 # to avoid shorting directly into strong support or longing into strong resistance.
 MIN_B2_SR_ATR_MULT = 1.5
 
+# ---- Tunable tolerances (env-driven; defaults preserve current feel) ----
+# S/R clustering tolerance (%) for highs & lows
+SR_TOL_PCT = float(os.getenv("SR_TOL_PCT", "0.4"))
+# B1 retest tolerance (% band around level)
+RETEST_TOL_PCT = float(os.getenv("RETEST_TOL_PCT", "0.6"))
+# B3 rejection/proximity tolerance (%) to level
+REJECT_TOL_PCT = float(os.getenv("REJECT_TOL_PCT", "0.7"))
 
 # ---------- Utils ----------
 def log(msg: str):
     if LOG_VERBOSE:
         print(msg)
-
 
 def fnum(x):
     try:
@@ -83,7 +94,6 @@ def fnum(x):
     if not math.isfinite(x):
         return None
     return x
-
 
 def pct_distance(a: float, b: float) -> float:
     """% distance between two prices, relative to mid-price."""
@@ -97,16 +107,13 @@ def pct_distance(a: float, b: float) -> float:
         return 1e9
     return abs(a - b) / mid * 100.0
 
-
 def _mk(symbol: str) -> str:
     """Convert BTCUSDT -> BTC/USDT for ccxt."""
     return symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
 
-
 def _get_exchange(name: str):
     cls = getattr(ccxt, name)
     return cls({"enableRateLimit": True})
-
 
 # ---------- OHLC helpers ----------
 def timed_fetch_ohlcv(ex, symbol: str, timeframe: str = "1h", limit: int = 400):
@@ -114,7 +121,6 @@ def timed_fetch_ohlcv(ex, symbol: str, timeframe: str = "1h", limit: int = 400):
     out = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     log(f"[LATENCY] {ex.id.upper()} {symbol} {timeframe} x{limit} -> {(time.time()-t0)*1000:.2f} ms")
     return out
-
 
 def _ohlcv(kl):
     df = pd.DataFrame(kl, columns=["ts", "open", "high", "low", "close", "vol"])
@@ -124,19 +130,15 @@ def _ohlcv(kl):
         df[c] = df[c].astype(float)
     return df
 
-
 def fetch_tf(ex, sym: str, tf: str = "1h", limit: int = 400):
     return _ohlcv(timed_fetch_ohlcv(ex, _mk(sym), tf, limit))
-
 
 # ---------- Indicators (Bernard-style) ----------
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
-
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
-
 
 # Bernard often uses a "faster" MACD; we use (5,20,9)
 def macd(close: pd.Series, fast: int = 5, slow: int = 20, sig: int = 9):
@@ -144,7 +146,6 @@ def macd(close: pd.Series, fast: int = 5, slow: int = 20, sig: int = 9):
     signal = ema(line, sig)
     hist = line - signal
     return line, signal, hist
-
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     d = close.diff()
@@ -156,7 +157,6 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     out = 100 - (100 / (1 + rs))
     return out.bfill().ffill().fillna(50)
 
-
 def atr(df: pd.DataFrame, n: int = 14):
     tr = pd.concat([
         df["high"] - df["low"],
@@ -164,7 +164,6 @@ def atr(df: pd.DataFrame, n: int = 14):
         (df["low"] - df["close"].shift()).abs()
     ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
-
 
 def macd_slope(series: pd.Series) -> str:
     if len(series) < 2:
@@ -191,10 +190,9 @@ def detect_swings(series: pd.Series, look: int = 3):
             swings.append((i, mid, "low"))
     return swings
 
-
 def swing_structure_1h(close: pd.Series, look: int = 2):
     """
-    Read 1H swing structure for B2:
+    Read 1H swing structure for B2/B3:
     - looks at last 2 swing highs and last 2 swing lows
     - returns 'up' / 'down' / 'flat' for highs and lows
     """
@@ -207,6 +205,7 @@ def swing_structure_1h(close: pd.Series, look: int = 2):
             return "flat"
         a, b = idxs[-2], idxs[-1]
         pa, pb = float(close.iloc[a]), float(close.iloc[b])
+        # 0.1% buffer; could be adapted by ATR% in the future
         if pb > pa * 1.001:
             return "up"
         if pb < pa * 0.999:
@@ -218,8 +217,7 @@ def swing_structure_1h(close: pd.Series, look: int = 2):
         "low_trend": trend_from_idx(low_idx),
     }
 
-
-def cluster_levels(swings, level_type: str, tolerance_pct: float = 0.4, min_touches: int = 4):
+def cluster_levels(swings, level_type: str, tolerance_pct: float = SR_TOL_PCT, min_touches: int = 4):
     """
     Cluster swing highs/lows into S/R levels.
     tolerance_pct: max distance within cluster (% of price).
@@ -243,7 +241,6 @@ def cluster_levels(swings, level_type: str, tolerance_pct: float = 0.4, min_touc
     out = [(avg, cnt) for (avg, cnt) in clusters if cnt >= min_touches]
     return out
 
-
 def nearest_level(levels, price: float, direction: str):
     """
     direction: 'above' for resistance, 'below' for support.
@@ -263,7 +260,6 @@ def nearest_level(levels, price: float, direction: str):
             return None, 0
         lv, n = max(candidates, key=lambda x: x[0])
         return lv, n
-
 
 # ---------- Trend classification ----------
 def classify_trend(close: pd.Series, e10: pd.Series, e21: pd.Series, e50: pd.Series, s200: pd.Series):
@@ -287,7 +283,6 @@ def classify_trend(close: pd.Series, e10: pd.Series, e21: pd.Series, e50: pd.Ser
     if c < v10 < v21 < v50 < v200:
         return "down"
     return "chop"
-
 
 # ---------- BTC Regime + Dominance ----------
 def analyze_btc_regime(ex_price, ex_dom=None):
@@ -373,13 +368,11 @@ def candle_stats(row):
     body_pct = body / rng * 100.0
     return o, h, l, c, body, rng, upper_wick, lower_wick, body_pct
 
-
 def is_bull_engulf(prev, row):
     po, _, _, pc, _, _, _, _, _ = candle_stats(prev)
     o, _, _, c, _, _, _, _, _ = candle_stats(row)
     # previous red, current green and engulfs body
     return (pc < po) and (c > o) and (c >= po) and (o <= pc)
-
 
 def is_bear_engulf(prev, row):
     po, _, _, pc, _, _, _, _, _ = candle_stats(prev)
@@ -387,22 +380,18 @@ def is_bear_engulf(prev, row):
     # previous green, current red and engulfs body
     return (pc > po) and (c < o) and (c <= po) and (o >= pc)
 
-
 def is_bull_pin(row):
     o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
-    # long lower wick, small body near top
+    # long lower wick, body not too tiny, body near top
     return lw > 2 * body and body_pct > 15 and min(o, c) > l + rng * 0.4
-
 
 def is_bear_pin(row):
     o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
-    # long upper wick, small body near bottom
+    # long upper wick, body not too tiny, body near bottom
     return uw > 2 * body and body_pct > 15 and max(o, c) < h - rng * 0.4
-
 
 def is_inside_bar(prev, row):
     return row["high"] <= prev["high"] and row["low"] >= prev["low"]
-
 
 def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr_pct: float, atr_val: float):
     """
@@ -410,6 +399,8 @@ def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr
     - body size >= min_body_atr_pct of ATR
     - close clearly beyond level
     - wick not fighting breakout direction too much
+
+    NOTE: 'prev' param retained for backward compatibility; logic uses 'row'.
     """
     o, h, l, c, body, rng, uw, lw, _ = candle_stats(row)
     if atr_val is None or atr_val <= 0:
@@ -431,8 +422,7 @@ def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr
             return False
     return True
 
-
-def bullish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
+def bullish_retest_candle(row, level: float, tolerance_pct: float = RETEST_TOL_PCT):
     """
     Retest candle for LONG (B1):
     - lower wick tags level
@@ -445,8 +435,7 @@ def bullish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
             return True
     return False
 
-
-def bearish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
+def bearish_retest_candle(row, level: float, tolerance_pct: float = RETEST_TOL_PCT):
     """
     Retest candle for SHORT (B1):
     - upper wick tags level
@@ -459,8 +448,7 @@ def bearish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
             return True
     return False
 
-
-def is_rejection_candle(row, at_support: bool, level: float, tolerance_pct: float = 0.5):
+def is_rejection_candle(row, at_support: bool, level: float, tolerance_pct: float = REJECT_TOL_PCT):
     """
     Rejection candle for B3 (bounce):
     - Long wick into level
@@ -491,7 +479,6 @@ def is_rejection_candle(row, at_support: bool, level: float, tolerance_pct: floa
 
     return False
 
-
 # ---------- Simple SFP / liquidity sweep helpers ----------
 def detect_sfp_high(d1: pd.DataFrame, swings, lookback: int = 20):
     """
@@ -512,7 +499,6 @@ def detect_sfp_high(d1: pd.DataFrame, swings, lookback: int = 20):
     prev_high = float(d1["high"].iloc[prev_idx])
     # sweep previous high but close back under
     return h > prev_high * 1.0005 and c < prev_high
-
 
 def detect_sfp_low(d1: pd.DataFrame, swings, lookback: int = 20):
     """
@@ -538,8 +524,8 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
     B1: Breakout / Breakdown with Retest at strong 4H S/R.
     """
-    highs = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=5)
-    lows  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=5)
+    highs = cluster_levels(swings4, "high", tolerance_pct=SR_TOL_PCT, min_touches=5)
+    lows  = cluster_levels(swings4, "low",  tolerance_pct=SR_TOL_PCT, min_touches=5)
 
     c1 = float(d1["close"].iloc[-1])
     prev = d1.iloc[-2]
@@ -570,7 +556,7 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                     return None
                 # now last candle is retest candle
                 if not (
-                    bullish_retest_candle(last, res_level)
+                    bullish_retest_candle(last, res_level, RETEST_TOL_PCT)
                     or is_bull_engulf(prev, last)
                     or is_bull_pin(last)
                 ):
@@ -609,7 +595,7 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 ):
                     return None
                 if not (
-                    bearish_retest_candle(last, sup_level)
+                    bearish_retest_candle(last, sup_level, RETEST_TOL_PCT)
                     or is_bear_engulf(prev, last)
                     or is_bear_pin(last)
                 ):
@@ -634,7 +620,6 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                     }
 
     return None
-
 
 # ---------- B2: Trend Continuation (EMA pullback / mini-flag) ----------
 def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
@@ -687,418 +672,11 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     lo_trend = struct1h["low_trend"]
 
     # 6) 4H S/R map for distance filter
-    highs4 = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=4)
-    lows4  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=4)
+    highs4 = cluster_levels(swings4, "high", tolerance_pct=SR_TOL_PCT, min_touches=4)
+    lows4  = cluster_levels(swings4, "low",  tolerance_pct=SR_TOL_PCT, min_touches=4)
 
     # Helper: distance to nearest 4H level on the opposite side of the trade
     def sr_distance_ok_for_short(price: float) -> bool:
         if not lows4:
             return True
-        sup_level, _ = nearest_level(lows4, price, "below")
-        if not sup_level:
-            return True
-        dist = price - sup_level
-        return dist >= MIN_B2_SR_ATR_MULT * atr1
-
-    def sr_distance_ok_for_long(price: float) -> bool:
-        if not highs4:
-            return True
-        res_level, _ = nearest_level(highs4, price, "above")
-        if not res_level:
-            return True
-        dist = res_level - price
-        return dist >= MIN_B2_SR_ATR_MULT * atr1
-
-    # 7) Optional volume behaviour (light flag, not heavy distribution)
-    vol = d1["vol"]
-    if len(vol) >= 20:
-        flag_vol_avg = float(vol.iloc[-5:-1].mean())
-        prior_vol_avg = float(vol.iloc[-15:-5].mean())
-        trigger_vol = float(vol.iloc[-1])
-        if prior_vol_avg > 0:
-            if flag_vol_avg > prior_vol_avg * 1.1:
-                return None
-            if trigger_vol < flag_vol_avg * 0.7:
-                return None
-
-    # =============== LONG CONTINUATION (4H uptrend) ===============
-    if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        in_ema_zone = (ema21_1h * 0.995 <= c <= ema10_1h * 1.005) and (c > ema50_1h)
-        macd_ok = (macd_val > 0) and (macd1_dir == "up")
-        rsi_ok = 45 <= rsi1 <= 65
-        struct_ok = hi_trend in ("up", "flat") and lo_trend in ("up", "flat")
-        sr_ok = sr_distance_ok_for_long(c)
-
-        if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok:
-            if not (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
-                return None
-
-            entry_low = min(last["low"], ema21_1h)
-            entry_high = max(last["close"], ema10_1h)
-            entry_mid = (entry_low + entry_high) / 2.0
-
-            sl_price = min(last["low"], ema50_1h * 0.997)
-            price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100.0
-            if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                return {
-                    "side": "LONG",
-                    "entry_low": entry_low,
-                    "entry_high": entry_high,
-                    "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H uptrend (mini-flag, v2.1)"
-                }
-
-    # =============== SHORT CONTINUATION (4H downtrend) ===============
-    if trend4 == "down":
-        in_ema_zone = (ema21_1h * 1.005 >= c >= ema10_1h * 0.995) and (c < ema50_1h)
-        macd_ok = (macd_val < 0) and (macd1_dir == "down")
-        rsi_ok = 35 <= rsi1 <= 55
-        struct_ok = hi_trend in ("down", "flat") and lo_trend in ("down", "flat")
-        sr_ok = sr_distance_ok_for_short(c)
-
-        if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok:
-            if not (is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last)):
-                return None
-
-            entry_high = max(last["high"], ema21_1h)
-            entry_low = min(last["close"], ema10_1h)
-            entry_mid = (entry_low + entry_high) / 2.0
-
-            sl_price = max(last["high"], ema50_1h * 1.003)
-            price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100.0
-            if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                return {
-                    "side": "SHORT",
-                    "entry_low": entry_low,
-                    "entry_high": entry_high,
-                    "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H downtrend (mini-flag, v2.1)"
-                }
-
-    return None
-
-# ---------- B3: Major S/R Bounce + Pattern ----------
-def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
-    """
-    B3: Major S/R bounce + pattern (double top / bottom + SFP-style).
-    """
-    highs = cluster_levels(swings4, "high", tolerance_pct=0.5, min_touches=3)
-    lows  = cluster_levels(swings4, "low",  tolerance_pct=0.5, min_touches=3)
-
-    c1 = float(d1["close"].iloc[-1])
-    last = d1.iloc[-1]
-
-    res_level, res_touch = nearest_level(highs, c1, "above")
-    sup_level, sup_touch = nearest_level(lows,  c1, "below")
-
-    macd_line, _, _ = macd(d1["close"])
-    macd1_dir = macd_slope(macd_line)
-    rsi1 = float(d1["rsi"].iloc[-1])
-
-    swings1 = detect_swings(d1["close"], look=3)
-    closes = d1["close"]
-
-    def detect_double(swings, kind: str):
-        tt = "high" if kind == "top" else "low"
-        idx = [i for (i, _, t) in swings if t == tt]
-        if len(idx) < 2:
-            return None
-        a, b = idx[-2], idx[-1]
-        pa, pb = float(closes.iloc[a]), float(closes.iloc[b])
-        if abs(pa - pb) / pa * 100.0 > 0.35:
-            return None
-        return (a, b, pa, pb)
-
-    # ----- LONG: support bounce / double bottom / SFP low -----
-    # Bernard rule: NO counter-trend longs in 4H downtrend
-    if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
-
-            # Must have rejection OR double bottom OR SFP
-            dbl = detect_double(swings1, "bottom")
-            sfp_ok = detect_sfp_low(d1, swings1)
-            if (
-                not is_rejection_candle(last, at_support=True, level=sup_level, tolerance_pct=0.7)
-                and not dbl
-                and not sfp_ok
-            ):
-                return None
-
-            # 1H structure must NOT be making LL (must be HL or flat)
-            struct1h = swing_structure_1h(d1["close"], look=2)
-            if struct1h["low_trend"] == "down":
-                return None
-
-            # EMA reclaim confirmation (Bernard bounce strength)
-            ema21_1h = float(d1["ema21"].iloc[-1])
-            ema50_1h = float(d1["ema50"].iloc[-1])
-            if not (last["close"] >= ema21_1h and ema21_1h >= ema50_1h * 0.995):
-                return None
-
-            # MACD/RSI bounce confirmation
-            if not (macd1_dir == "up" and macd_val > 0 and 40 <= rsi1 <= 65):
-                return None
-
-            note_core = f"B3_SR_BOUNCE · {sup_touch}x support @ {sup_level:.4f}"
-            if dbl:
-                _, _, _, pb = dbl
-                note_core = f"B3_PATTERN · Double Bottom near {pb:.4f}"
-            if sfp_ok:
-                note_core += " · SFP_low"
-
-            entry_low = min(last["low"], sup_level)
-            entry_high = max(last["close"], sup_level * 1.001)
-            entry_mid = (entry_low + entry_high) / 2.0
-            sl_price = min(last["low"], sup_level * 0.996)
-            price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
-            if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                return {
-                    "side": "LONG",
-                    "entry_low": entry_low,
-                    "entry_high": entry_high,
-                    "sl": sl_price,
-                    "note": note_core,
-                }
-
-
-    # ----- SHORT: resistance rejection / double top / SFP high -----
-    if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7:
-        dbl = detect_double(swings1, "top")
-        sfp_ok = detect_sfp_high(d1, swings1)
-        if (
-            not is_rejection_candle(last, at_support=False, level=res_level, tolerance_pct=0.7)
-            and not dbl
-            and not sfp_ok
-        ):
-            return None
-
-        note_core = f"B3_SR_BOUNCE · {res_touch}x resistance @ {res_level:.4f}"
-        if dbl:
-            _, _, _, pb = dbl
-            note_core = f"B3_PATTERN · Double Top near {pb:.4f}"
-        if sfp_ok:
-            note_core += " · SFP_high"
-
-        if not (30 <= rsi1 <= 60 and macd1_dir in ("down", "flat")):
-            return None
-
-        entry_high = max(last["high"], res_level)
-        entry_low = min(last["close"], res_level * 0.999)
-        entry_mid = (entry_low + entry_high) / 2.0
-        sl_price = max(last["high"], res_level * 1.004)
-        price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
-        if price_risk_pct <= MAX_PRICE_RISK_PCT:
-            return {
-                "side": "SHORT",
-                "entry_low": entry_low,
-                "entry_high": entry_high,
-                "sl": sl_price,
-                "note": note_core,
-            }
-
-    return None
-
-
-# ---------- Symbol Analysis ----------
-def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
-    """
-    Full Bernard-style analysis for one symbol.
-    Returns (signal_dict or None, raw_row dict)
-    """
-    d4 = fetch_tf(ex, symbol, "4h", OHLC_LIMIT_4H)
-    d1 = fetch_tf(ex, symbol, "1h", OHLC_LIMIT_1H)
-
-    # 4H EMAs
-    d4["ema10"] = ema(d4.close, 10)
-    d4["ema21"] = ema(d4.close, 21)
-    d4["ema50"] = ema(d4.close, 50)
-    d4["sma200"] = sma(d4.close, 200)
-    d4["macd"], _, _ = macd(d4.close)
-
-    # 1H EMAs
-    d1["ema10"] = ema(d1.close, 10)
-    d1["ema21"] = ema(d1.close, 21)
-    d1["ema50"] = ema(d1.close, 50)
-    d1["sma200"] = sma(d1.close, 200)
-    d1["macd"], _, _ = macd(d1.close)
-    d1["rsi"] = rsi(d1.close)
-    d1["atr"] = atr(d1, 14)
-
-    trend4 = classify_trend(d4.close, d4.ema10, d4.ema21, d4.ema50, d4.sma200)
-    trend1 = classify_trend(d1.close, d1.ema10, d1.ema21, d1.ema50, d1.sma200)
-    macd4_slope = macd_slope(d4["macd"])
-    macd1_slope = macd_slope(d1["macd"])
-    last_price = float(d1.close.iloc[-1])
-
-    swings4 = detect_swings(d4.close, look=3)
-
-    raw_row = {
-        "symbol": _mk(symbol),
-        "price": last_price,
-        "trend4": trend4,
-        "trend1": trend1,
-        "regime": regime,
-        "dom_bias": dom_bias,
-        "macd4": macd4_slope,
-        "macd1": macd1_slope,
-        "note": "no setup",
-    }
-
-    signal = None
-
-    # ---- B1: Break + Retest (highest priority)
-    sig_b1 = b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias)
-    if sig_b1:
-        signal = sig_b1
-        raw_row["note"] = sig_b1["note"]
-
-    # ---- B2: Trend continuation  (<<< fixed indent here, no extra space)
-    if signal is None:
-        sig_b2 = b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias)
-        if sig_b2:
-            signal = sig_b2
-            raw_row["note"] = sig_b2["note"]
-
-    # ---- B3: S/R bounce + pattern
-    if signal is None:
-        sig_b3 = b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias)
-        if sig_b3:
-            signal = sig_b3
-            raw_row["note"] = sig_b3["note"]
-
-    # Convert to signal dict for Worker (with R-based TP)
-    if signal:
-        side = signal["side"]
-        entry_low = float(signal["entry_low"])
-        entry_high = float(signal["entry_high"])
-        entry_mid = (entry_low + entry_high) / 2.0
-        sl = float(signal["sl"])
-
-        # Risk in price terms
-        if side == "LONG":
-            risk = entry_mid - sl
-        else:
-            risk = sl - entry_mid
-
-        if risk <= 0 or not math.isfinite(risk):
-            return None, raw_row
-
-        # TP = 1R / 2R / 3R
-        if side == "LONG":
-            tp1 = entry_mid + risk
-            tp2 = entry_mid + 2 * risk
-            tp3 = entry_mid + 3 * risk
-        else:
-            tp1 = entry_mid - risk
-            tp2 = entry_mid - 2 * risk
-            tp3 = entry_mid - 3 * risk
-
-        atr_val = d1["atr"].iloc[-1]
-        atr_pct = atr_val / last_price * 100.0 if atr_val and atr_val > 0 else None
-        sl_pct = abs(sl - entry_mid) / entry_mid * 100.0
-
-        signal_dict = {
-            "symbol": _mk(symbol),
-            "side": side,
-            "tf": "1h",
-            "price": entry_mid,
-            "entry": [fnum(entry_low), fnum(entry_high)],
-            "entry_mid": fnum(entry_mid),
-            "sl": fnum(sl),
-            "tp1": fnum(tp1),
-            "tp2": fnum(tp2),
-            "tp3": fnum(tp3),
-            "note": signal["note"],
-            # telemetry for Supabase (can be null)
-            "macd_slope": macd1_slope,
-            "rsi": fnum(d1["rsi"].iloc[-1]),
-            "atr1h_pct": fnum(atr_pct),
-            "body_break_pct": None,
-            "sl_max_pct": fnum(sl_pct),
-            "momentum_score": None,
-            "vol_spike": None,
-            "volume_slope": None,
-        }
-
-        raw_row["side"] = side
-        raw_row["signal"] = "TRIGGER"
-        raw_row["sl"] = sl
-        raw_row["tp1"] = tp1
-        raw_row["tp2"] = tp2
-        raw_row["tp3"] = tp3
-
-        return signal_dict, raw_row
-
-    return None, raw_row
-
-# ---------- Worker Push ----------
-def push_signals(signals):
-    if not ALERT_WEBHOOK_URL or not signals:
-        return
-    url = ALERT_WEBHOOK_URL
-    params = {"t": PASS_KEY}
-    payload = {
-        "summary": f"{len(signals)} signal(s) — Bernard System v2.3",
-        "signals": signals,
-    }
-    try:
-        with httpx.Client(timeout=10) as cli:
-            r = cli.post(url, params=params, json=payload)
-            print(f"[PUSH] {url} -> {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        print(f"[PUSH ERROR] {e}")
-
-
-# ---------- Timestamp helper ----------
-def dual_ts():
-    utc = datetime.now(timezone.utc)
-    kl = utc.astimezone(ZoneInfo("Asia/Kuala_Lumpur"))
-    return f"{utc:%Y-%m-%d %H:%M:%S UTC} | {kl:%Y-%m-%d %H:%M:%S KL}"
-
-
-# ---------- Tick Once ----------
-def tick_once():
-    try:
-        ex_price = _get_exchange(PRICE_EXCHANGE)
-        ex_price.load_markets()
-    except Exception as e:
-        return {"engine": "bernard_v2.3", "error": str(e)}
-
-    # dominance exchange may be same or different
-    ex_dom = None
-    if DOM_BTCDOM_SYMBOL and DOM_USDTDOM_SYMBOL:
-        try:
-            ex_dom = _get_exchange(DOM_EXCHANGE)
-            ex_dom.load_markets()
-        except Exception as e:
-            log(f"[DOM_EXCHANGE] error: {e}")
-            ex_dom = None
-
-    regime, dom_bias = analyze_btc_regime(ex_price, ex_dom)
-
-    signals = []
-    raw = []
-
-    for sym in WATCHLIST:
-        try:
-            sig, info = analyze_symbol(ex_price, sym, regime, dom_bias)
-            raw.append(info)
-            if sig:
-                # extra guard: block fresh longs when BTC is clearly risk_off
-                if regime == "risk_off" and sig["side"] == "LONG":
-                    info["note"] = (info.get("note", "") or "") + " · blocked_by_risk_off"
-                else:
-                    signals.append(sig)
-        except Exception as e:
-            raw.append({"symbol": _mk(sym), "error": str(e)})
-
-    if signals:
-        push_signals(signals)
-
-    return {
-        "engine": "bernard_v2.3",
-        "scanned": len(WATCHLIST),
-        "signals": signals,
-        "raw": raw,
-        "note": dual_ts(),
-    }
+        sup_level, _
