@@ -1,17 +1,17 @@
 # ==========================================================
-#  engine.py — Bernard System v1.0 (Pure Bernard Logic)
+#  engine.py — Bernard System v2.0 (Pure Bernard Logic)
 #
 #  - 3 Bernard families:
 #       B1: Breakout + Retest at strong 4H S/R
 #       B2: Trend Continuation (EMA pullback / mini-flag)
-#       B3: Major S/R Bounce + Pattern (double top/bottom)
+#       B3: Major S/R Bounce + Pattern (double top/bottom + SFP-style)
 #
 #  - BTC regime filter (risk_on / risk_off / neutral)
 #  - Optional dominance bias (BTCDOM + USDTDOM via env)
 #  - Structure-based SL, price risk capped at 5%
 #    (so with 10% margin & 10x lev, account loss ≤ 5%)
 #  - TP = 1R / 2R / 3R
-#  - Safe for Koyeb free plan (hourly run, 4H+1H only)
+#  - Safe for Koyeb free plan (4H + 1H only, hourly run)
 #  - Fully compatible with Worker & Supabase contracts
 # ==========================================================
 
@@ -316,19 +316,88 @@ def analyze_btc_regime(ex_price, ex_dom=None):
     return regime, dom_bias
 
 
-# ---------- Candlestick helpers ----------
-def bullish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
-    """
-    Retest candle for LONG (B1):
-    - lower wick tags level (low <= level*(1+tol%))
-    - close > open (bullish)
-    - close above level
-    """
+# ---------- Candlestick helpers (v2.0) ----------
+def candle_stats(row):
     o = row["open"]
     h = row["high"]
     l = row["low"]
     c = row["close"]
+    body = abs(c - o)
+    rng = h - l
+    if rng <= 0:
+        rng = 1e-9
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body_pct = body / rng * 100.0
+    return o, h, l, c, body, rng, upper_wick, lower_wick, body_pct
 
+
+def is_bull_engulf(prev, row):
+    po, ph, pl, pc, pbody, _, _, _, _ = candle_stats(prev)
+    o, h, l, c, body, _, _, _, _ = candle_stats(row)
+    # previous red, current green and engulfs body
+    return (pc < po) and (c > o) and (c >= po) and (o <= pc)
+
+
+def is_bear_engulf(prev, row):
+    po, ph, pl, pc, pbody, _, _, _, _ = candle_stats(prev)
+    o, h, l, c, body, _, _, _, _ = candle_stats(row)
+    # previous green, current red and engulfs body
+    return (pc > po) and (c < o) and (c <= po) and (o >= pc)
+
+
+def is_bull_pin(row):
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
+    # long lower wick, small body near top
+    return lw > 2 * body and body_pct > 15 and min(o, c) > l + rng * 0.4
+
+
+def is_bear_pin(row):
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
+    # long upper wick, small body near bottom
+    return uw > 2 * body and body_pct > 15 and max(o, c) < h - rng * 0.4
+
+
+def is_inside_bar(prev, row):
+    return row["high"] <= prev["high"] and row["low"] >= prev["low"]
+
+
+def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr_pct: float, atr_val: float):
+    """
+    Strong breakout candle:
+    - body size >= min_body_atr_pct of ATR
+    - close clearly beyond level
+    - wick not fighting breakout direction too much
+    """
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
+    if atr_val is None or atr_val <= 0:
+        return False
+    body_atr_pct = body / atr_val * 100.0
+    if body_atr_pct < min_body_atr_pct:
+        return False
+
+    if direction == "up":
+        if c <= level:
+            return False
+        # avoid huge upper wick against direction
+        if uw / rng > 0.5:
+            return False
+    else:
+        if c >= level:
+            return False
+        if lw / rng > 0.5:
+            return False
+    return True
+
+
+def bullish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
+    """
+    Retest candle for LONG (B1):
+    - lower wick tags level
+    - close > open
+    - close above level
+    """
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
     if l <= level * (1 + tolerance_pct / 100) and h >= level * (1 - tolerance_pct / 100):
         if c > o and c > level:
             return True
@@ -338,15 +407,11 @@ def bullish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
 def bearish_retest_candle(row, level: float, tolerance_pct: float = 0.4):
     """
     Retest candle for SHORT (B1):
-    - upper wick tags level (high >= level*(1-tol%))
-    - close < open (bearish)
+    - upper wick tags level
+    - close < open
     - close below level
     """
-    o = row["open"]
-    h = row["high"]
-    l = row["low"]
-    c = row["close"]
-
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
     if h >= level * (1 - tolerance_pct / 100) and l <= level * (1 + tolerance_pct / 100):
         if c < o and c < level:
             return True
@@ -359,101 +424,153 @@ def is_rejection_candle(row, at_support: bool, level: float, tolerance_pct: floa
     - Long wick into level
     - Strong body away from level
     """
-    o = row["open"]
-    h = row["high"]
-    l = row["low"]
-    c = row["close"]
-    body = abs(c - o)
-    range_ = h - l
-    if range_ <= 0:
+    o, h, l, c, body, rng, uw, lw, body_pct = candle_stats(row)
+    if rng <= 0:
         return False
 
-    body_pct = body / range_ * 100
-
     if at_support:
-        # long lower wick, close above open, near or above level
-        lower_wick = min(o, c) - l
-        if l <= level * (1 + tolerance_pct / 100) and lower_wick / range_ > 0.4 and c > o and body_pct > 25:
+        lower_wick = lw
+        if l <= level * (1 + tolerance_pct / 100) and lower_wick / rng > 0.4 and c > o and body_pct > 20:
             return True
     else:
-        # long upper wick, close below open, near or below level
-        upper_wick = h - max(o, c)
-        if h >= level * (1 - tolerance_pct / 100) and upper_wick / range_ > 0.4 and c < o and body_pct > 25:
+        upper_wick = uw
+        if h >= level * (1 - tolerance_pct / 100) and upper_wick / rng > 0.4 and c < o and body_pct > 20:
             return True
 
     return False
+
+
+# ---------- Simple SFP / liquidity sweep helpers ----------
+def detect_sfp_high(d1: pd.DataFrame, swings, lookback: int = 20):
+    """
+    Detect simple swing-failure pattern at highs:
+    - current high takes previous swing high
+    - close back inside
+    """
+    if len(d1) < 5 or not swings:
+        return False
+    last_idx = len(d1) - 1
+    recent_swings = [i for (i, p, t) in swings if t == "high" and last_idx - lookback <= i < last_idx]
+    if not recent_swings:
+        return False
+    last = d1.iloc[-1]
+    h = last["high"]
+    c = last["close"]
+    prev_idx = recent_swings[-1]
+    prev_high = float(d1["high"].iloc[prev_idx])
+    # sweep previous high but close back under
+    return h > prev_high * 1.0005 and c < prev_high
+
+
+def detect_sfp_low(d1: pd.DataFrame, swings, lookback: int = 20):
+    """
+    Detect simple swing-failure pattern at lows:
+    - current low takes previous swing low
+    - close back inside
+    """
+    if len(d1) < 5 or not swings:
+        return False
+    last_idx = len(d1) - 1
+    recent_swings = [i for (i, p, t) in swings if t == "low" and last_idx - lookback <= i < last_idx]
+    if not recent_swings:
+        return False
+    last = d1.iloc[-1]
+    l = last["low"]
+    c = last["close"]
+    prev_idx = recent_swings[-1]
+    prev_low = float(d1["low"].iloc[prev_idx])
+    return l < prev_low * 0.9995 and c > prev_low
 
 
 # ---------- B1: Breakout + Retest ----------
 def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
     B1: Breakout / Breakdown with Retest at strong 4H S/R.
+    Now with:
+      - strong breakout candle check
+      - MACD/RSI filter
+      - retest candle pattern filter (engulf / pin / rejection)
     """
-    highs = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=4)
-    lows  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=4)
+    highs = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=5)
+    lows  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=5)
 
     c1 = float(d1["close"].iloc[-1])
-    prev_close = float(d1["close"].iloc[-2])
+    prev = d1.iloc[-2]
     last = d1.iloc[-1]
 
-    # find nearest res/support around price zone
     res_level, res_touch = nearest_level(highs, c1, "above")
     sup_level, sup_touch = nearest_level(lows,  c1, "below")
 
-    # MACD / RSI on 1H
     macd_line, _, _ = macd(d1["close"])
     macd1_dir = macd_slope(macd_line)
     rsi1 = float(d1["rsi"].iloc[-1])
+    atr_val = float(d1["atr"].iloc[-1]) if "atr" in d1.columns else None
 
-    # ---- LONG: breakout above resistance, retest, bullish candle
+    # ---- LONG: breakout above resistance, retest, bullish confirmation
     if regime != "risk_off" and trend4 == "up" and dom_bias != "btc_pump_usdt_dump":
         if res_level:
-            # break: previous close below, current clear above
-            if prev_close <= res_level and c1 > res_level * 1.001:
-                if bullish_retest_candle(last, res_level):
-                    if not (45 <= rsi1 <= 70 and macd1_dir == "up"):
-                        # indicators not confirming
-                        return None
+            prev_close = float(prev["close"])
+            # check strong break candle (prev) across level
+            if prev_close > res_level * 1.001 and float(prev["open"]) <= res_level:
+                if not is_strong_break_candle(d1.iloc[-3], prev, res_level, "up", min_body_atr_pct=40, atr_val=atr_val):
+                    return None
+                # now last candle is retest candle
+                if not (
+                    bullish_retest_candle(last, res_level) or
+                    is_bull_engulf(prev, last) or
+                    is_bull_pin(last)
+                ):
+                    return None
+                if not (45 <= rsi1 <= 70 and macd1_dir in ("up", "flat")):
+                    return None
 
-                    entry_low = max(res_level, last["open"])
-                    entry_high = last["close"] * 1.0015
-                    entry_mid = (entry_low + entry_high) / 2.0
+                entry_low = max(res_level, last["open"])
+                entry_high = last["close"] * 1.0015
+                entry_mid = (entry_low + entry_high) / 2.0
 
-                    sl_price = min(last["low"], res_level * 0.997)
-                    price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
+                sl_price = min(last["low"], res_level * 0.997)
+                price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
 
-                    if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                        return {
-                            "side": "LONG",
-                            "entry_low": entry_low,
-                            "entry_high": entry_high,
-                            "sl": sl_price,
-                            "note": f"B1_BREAK_RETEST · {res_touch}x resistance @ {res_level:.4f}"
-                        }
+                if price_risk_pct <= MAX_PRICE_RISK_PCT:
+                    return {
+                        "side": "LONG",
+                        "entry_low": entry_low,
+                        "entry_high": entry_high,
+                        "sl": sl_price,
+                        "note": f"B1_BREAK_RETEST · {res_touch}x resistance @ {res_level:.4f}"
+                    }
 
-    # ---- SHORT: breakdown below support, retest, bearish candle
+    # ---- SHORT: breakdown below support, retest, bearish confirmation
     if trend4 == "down":
         if sup_level:
-            if prev_close >= sup_level and c1 < sup_level * 0.999:
-                if bearish_retest_candle(last, sup_level):
-                    if not (30 <= rsi1 <= 60 and macd1_dir == "down"):
-                        return None
+            prev_close = float(prev["close"])
+            if prev_close < sup_level * 0.999 and float(prev["open"]) >= sup_level:
+                if not is_strong_break_candle(d1.iloc[-3], prev, sup_level, "down", min_body_atr_pct=40, atr_val=atr_val):
+                    return None
+                if not (
+                    bearish_retest_candle(last, sup_level) or
+                    is_bear_engulf(prev, last) or
+                    is_bear_pin(last)
+                ):
+                    return None
+                if not (30 <= rsi1 <= 60 and macd1_dir in ("down", "flat")):
+                    return None
 
-                    entry_high = min(sup_level, last["open"])
-                    entry_low = last["close"] * 0.9985
-                    entry_mid = (entry_low + entry_high) / 2.0
+                entry_high = min(sup_level, last["open"])
+                entry_low = last["close"] * 0.9985
+                entry_mid = (entry_low + entry_high) / 2.0
 
-                    sl_price = max(last["high"], sup_level * 1.003)
-                    price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
+                sl_price = max(last["high"], sup_level * 1.003)
+                price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
 
-                    if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                        return {
-                            "side": "SHORT",
-                            "entry_low": entry_low,
-                            "entry_high": entry_high,
-                            "sl": sl_price,
-                            "note": f"B1_BREAK_RETEST · {sup_touch}x support @ {sup_level:.4f}"
-                        }
+                if price_risk_pct <= MAX_PRICE_RISK_PCT:
+                    return {
+                        "side": "SHORT",
+                        "entry_low": entry_low,
+                        "entry_high": entry_high,
+                        "sl": sl_price,
+                        "note": f"B1_BREAK_RETEST · {sup_touch}x support @ {sup_level:.4f}"
+                    }
 
     return None
 
@@ -462,7 +579,7 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
     """
     B2: Trend continuation using pullback to EMA10/21 on 1H.
-    Approximates Bernard's flag / continuation logic without overfitting.
+    Approximates Bernard's flag / continuation logic.
     """
     if trend4 not in ("up", "down"):
         return None
@@ -471,7 +588,6 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
     if regime == "risk_off" and trend4 == "up":
         return None
 
-    # 1H EMAs and ATR already computed
     last = d1.iloc[-1]
     prev = d1.iloc[-2]
 
@@ -480,19 +596,18 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
     if not atr1 or atr1 <= 0:
         return None
 
-    # small body pullback candles recently?
-    recent = d1.iloc[-4:-1]  # last 3 before current
+    # recent candles representing potential flag
+    recent = d1.iloc[-5:-1]  # last 4 before current
     ranges = (recent["high"] - recent["low"]).abs()
     bodies = (recent["close"] - recent["open"]).abs()
-    if len(ranges) < 3:
+    if len(ranges) < 4:
         return None
 
     avg_range = float(ranges.mean())
     avg_body = float(bodies.mean())
 
-    # We want body smaller than full range (sideways pullback)
+    # want relatively small-body consolidation
     if avg_body / avg_range > 0.7:
-        # big aggressive candles, not neat flag
         return None
 
     macd_line, _, _ = macd(d1["close"])
@@ -505,8 +620,11 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
 
     # LONG continuation in uptrend
     if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        # price above ema21, pullback into 10/21 zone, not below 50
-        if ema21 <= c <= ema10 * 1.005 and c > ema50 and macd1_dir == "up" and 40 <= rsi1 <= 70:
+        # pullback into EMA10/21 zone, not breaking EMA50
+        if ema21 * 0.995 <= c <= ema10 * 1.005 and c > ema50 and macd1_dir in ("up", "flat") and 40 <= rsi1 <= 70:
+            if not (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
+                return None
+
             entry_low = min(last["low"], ema21)
             entry_high = max(last["close"], ema10)
             entry_mid = (entry_low + entry_high) / 2.0
@@ -519,12 +637,15 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
                     "entry_low": entry_low,
                     "entry_high": entry_high,
                     "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H uptrend"
+                    "note": "B2_TREND_CONT · EMA pullback in 4H uptrend (mini-flag)"
                 }
 
     # SHORT continuation in downtrend
     if trend4 == "down":
-        if ema21 >= c >= ema10 * 0.995 and c < ema50 and macd1_dir == "down" and 30 <= rsi1 <= 60:
+        if ema21 * 1.005 >= c >= ema10 * 0.995 and c < ema50 and macd1_dir in ("down", "flat") and 30 <= rsi1 <= 60:
+            if not (is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last)):
+                return None
+
             entry_high = max(last["high"], ema21)
             entry_low = min(last["close"], ema10)
             entry_mid = (entry_low + entry_high) / 2.0
@@ -537,7 +658,7 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
                     "entry_low": entry_low,
                     "entry_high": entry_high,
                     "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H downtrend"
+                    "note": "B2_TREND_CONT · EMA pullback in 4H downtrend (mini-flag)"
                 }
 
     return None
@@ -546,7 +667,7 @@ def b2_trend_continuation(symbol, d4, d1, trend4, regime, dom_bias):
 # ---------- B3: Major S/R Bounce + Pattern ----------
 def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
-    B3: Major S/R bounce + pattern (double top / bottom).
+    B3: Major S/R bounce + pattern (double top / bottom + SFP-style).
     """
     highs = cluster_levels(swings4, "high", tolerance_pct=0.5, min_touches=3)
     lows  = cluster_levels(swings4, "low",  tolerance_pct=0.5, min_touches=3)
@@ -561,76 +682,83 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     macd1_dir = macd_slope(macd_line)
     rsi1 = float(d1["rsi"].iloc[-1])
 
-    # Swings on 1H for double top/bottom
     swings1 = detect_swings(d1["close"], look=3)
     closes = d1["close"]
 
-    # helper to detect double pattern
     def detect_double(swings, kind: str):
-        idx = [i for (i, _, t) in swings if t == ("high" if kind == "top" else "low")]
+        tt = "high" if kind == "top" else "low"
+        idx = [i for (i, _, t) in swings if t == tt]
         if len(idx) < 2:
             return None
         a, b = idx[-2], idx[-1]
         pa, pb = float(closes.iloc[a]), float(closes.iloc[b])
-        if abs(pa - pb) / pa * 100.0 > 0.4:
+        if abs(pa - pb) / pa * 100.0 > 0.35:
             return None
         return (a, b, pa, pb)
 
-    # ----- LONG: support bounce / double bottom -----
+    # ----- LONG: support bounce / double bottom / SFP low -----
     if regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
-            # rejection candle first
-            if is_rejection_candle(last, at_support=True, level=sup_level, tolerance_pct=0.7):
-                # double bottom?
-                dbl = detect_double(swings1, "bottom")
-                note_core = f"B3_SR_BOUNCE · {sup_touch}x support @ {sup_level:.4f}"
-                if dbl:
-                    _, _, _, pb = dbl
-                    note_core = f"B3_PATTERN · Double Bottom near {pb:.4f}"
-                # indicator confirmation
-                if not (30 <= rsi1 <= 70 and macd1_dir in ("up", "flat")):
-                    return None
-
-                entry_low = min(last["low"], sup_level)
-                entry_high = max(last["close"], sup_level * 1.001)
-                entry_mid = (entry_low + entry_high) / 2.0
-                sl_price = min(last["low"], sup_level * 0.996)
-                price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
-                if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                    return {
-                        "side": "LONG",
-                        "entry_low": entry_low,
-                        "entry_high": entry_high,
-                        "sl": sl_price,
-                        "note": note_core
-                    }
-
-    # ----- SHORT: resistance rejection / double top -----
-    if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7:
-        if is_rejection_candle(last, at_support=False, level=res_level, tolerance_pct=0.7):
-            dbl = detect_double(swings1, "top")
-            note_core = f"B3_SR_BOUNCE · {res_touch}x resistance @ {res_level:.4f}"
-            if dbl:
-                _, _, _, pb = dbl
-                note_core = f"B3_PATTERN · Double Top near {pb:.4f}"
-
-            # RSI filter – avoid FLM-type over-extended shorts (RSI 60+)
-            if not (30 <= rsi1 <= 60 and macd1_dir in ("down", "flat")):
+            dbl = detect_double(swings1, "bottom")
+            sfp_ok = detect_sfp_low(d1, swings1)
+            if not is_rejection_candle(last, at_support=True, level=sup_level, tolerance_pct=0.7) and not dbl and not sfp_ok:
                 return None
 
-            entry_high = max(last["high"], res_level)
-            entry_low = min(last["close"], res_level * 0.999)
+            note_core = f"B3_SR_BOUNCE · {sup_touch}x support @ {sup_level:.4f}"
+            if dbl:
+                _, _, _, pb = dbl
+                note_core = f"B3_PATTERN · Double Bottom near {pb:.4f}"
+            if sfp_ok:
+                note_core += " · SFP_low"
+
+            if not (30 <= rsi1 <= 70 and macd1_dir in ("up", "flat")):
+                return None
+
+            entry_low = min(last["low"], sup_level)
+            entry_high = max(last["close"], sup_level * 1.001)
             entry_mid = (entry_low + entry_high) / 2.0
-            sl_price = max(last["high"], res_level * 1.004)
-            price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
+            sl_price = min(last["low"], sup_level * 0.996)
+            price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
             if price_risk_pct <= MAX_PRICE_RISK_PCT:
                 return {
-                    "side": "SHORT",
+                    "side": "LONG",
                     "entry_low": entry_low,
                     "entry_high": entry_high,
                     "sl": sl_price,
                     "note": note_core
                 }
+
+    # ----- SHORT: resistance rejection / double top / SFP high -----
+    if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7:
+        dbl = detect_double(swings1, "top")
+        sfp_ok = detect_sfp_high(d1, swings1)
+        if not is_rejection_candle(last, at_support=False, level=res_level, tolerance_pct=0.7) and not dbl and not sfp_ok:
+            return None
+
+        note_core = f"B3_SR_BOUNCE · {res_touch}x resistance @ {res_level:.4f}"
+        if dbl:
+            _, _, _, pb = dbl
+            note_core = f"B3_PATTERN · Double Top near {pb:.4f}"
+        if sfp_ok:
+            note_core += " · SFP_high"
+
+        # RSI filter – avoid over-extended shorts like FLM with RSI>60
+        if not (30 <= rsi1 <= 60 and macd1_dir in ("down", "flat")):
+            return None
+
+        entry_high = max(last["high"], res_level)
+        entry_low = min(last["close"], res_level * 0.999)
+        entry_mid = (entry_low + entry_high) / 2.0
+        sl_price = max(last["high"], res_level * 1.004)
+        price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
+        if price_risk_pct <= MAX_PRICE_RISK_PCT:
+            return {
+                "side": "SHORT",
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "sl": sl_price,
+                "note": note_core
+            }
 
     return None
 
@@ -775,7 +903,7 @@ def push_signals(signals):
     url = ALERT_WEBHOOK_URL
     params = {"t": PASS_KEY}
     payload = {
-        "summary": f"{len(signals)} signal(s) — Bernard System v1.0",
+        "summary": f"{len(signals)} signal(s) — Bernard System v2.0",
         "signals": signals
     }
     try:
@@ -792,7 +920,7 @@ def tick_once():
         ex_price = _get_exchange(PRICE_EXCHANGE)
         ex_price.load_markets()
     except Exception as e:
-        return {"engine": "bernard_v1.0", "error": str(e)}
+        return {"engine": "bernard_v2.0", "error": str(e)}
 
     # dominance exchange may be same or different
     ex_dom = None
@@ -826,7 +954,7 @@ def tick_once():
         push_signals(signals)
 
     return {
-        "engine": "bernard_v1.0",
+        "engine": "bernard_v2.0",
         "scanned": len(WATCHLIST),
         "signals": signals,
         "raw": raw,
