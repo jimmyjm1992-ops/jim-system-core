@@ -64,6 +64,10 @@ WATCHLIST = [
 # With 10% capital, 10x leverage, this equals max 5% account loss.
 MAX_PRICE_RISK_PCT = 5.0
 
+# Minimum distance (in ATR multiples) from B2 entry price to nearest 4H S/R
+# to avoid shorting directly into strong support or longing into strong resistance.
+MIN_B2_SR_ATR_MULT = 1.5
+
 
 # ---------- Utils ----------
 def log(msg: str):
@@ -172,21 +176,31 @@ def macd_slope(series: pd.Series) -> str:
     return "flat"
 
 # ---------- Swings & S/R ----------
-def detect_swings(series: pd.Series, look: int = 3):
+def swing_structure_1h(close: pd.Series, look: int = 2):
     """
-    Return list of (idx, price, type) where type in {'high','low'}.
+    Very small helper to read 1H swing structure for B2:
+    - looks at last 2 swing highs and last 2 swing lows
+    - returns 'up' / 'down' / 'flat' for highs and lows
     """
-    swings = []
-    vals = series.values
-    for i in range(look, len(series) - look):
-        window = vals[i - look: i + look + 1]
-        mid = vals[i]
-        if mid == window.max():
-            swings.append((i, mid, "high"))
-        elif mid == window.min():
-            swings.append((i, mid, "low"))
-    return swings
+    swings = detect_swings(close, look=look)
+    high_idx = [i for (i, p, t) in swings if t == "high"]
+    low_idx  = [i for (i, p, t) in swings if t == "low"]
 
+    def trend_from_idx(idxs):
+        if len(idxs) < 2:
+            return "flat"
+        a, b = idxs[-2], idxs[-1]
+        pa, pb = float(close.iloc[a]), float(close.iloc[b])
+        if pb > pa * 1.001:
+            return "up"
+        if pb < pa * 0.999:
+            return "down"
+        return "flat"
+
+    return {
+        "high_trend": trend_from_idx(high_idx),
+        "low_trend": trend_from_idx(low_idx),
+    }
 
 def cluster_levels(swings, level_type: str, tolerance_pct: float = 0.4, min_touches: int = 4):
     """
@@ -609,18 +623,22 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     return None
 
 # ---------- B2: Trend Continuation (EMA pullback / mini-flag) ----------
-def b2_trend_continuation(symbol, d4, d1, swings4, trend4, trend1, regime, dom_bias):
+def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
-    B2: Trend continuation using pullback to EMA10/21 on 1H.
-    v2.3 upgrades:
-      - requires 4H trend + 1H trend alignment
-      - avoids entries directly into opposite 4H S/R
-      - keeps EMA10/21 "flag" structure + MACD/RSI filters
+    B2 v2.1: Trend continuation (Bernard-style) using EMA pullback / mini-flag.
+
+    Extra filters vs v2.0:
+    - 4H S/R distance filter (avoid shorting into strong support / longing into strong resistance)
+    - 1H swing structure (must be LH/LL for shorts, HH/HL for longs)
+    - Stricter MACD/RSI confirmation for trend continuation
+    - Optional volume behaviour check (flag consolidation has lighter volume than impulse,
+      trigger candle volume not dead)
     """
+    # 1) 4H trend must be clear up or down
     if trend4 not in ("up", "down"):
         return None
 
-    # global filter: skip long in hard risk_off
+    # 2) Global regime guard (still allow shorts in risk_off)
     if regime == "risk_off" and trend4 == "up":
         return None
 
@@ -632,102 +650,133 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, trend1, regime, dom_b
     if not atr1 or atr1 <= 0:
         return None
 
-    # recent candles representing potential flag (small consolidation)
+    # 3) Flag-style consolidation: last 4 candles before trigger
     recent = d1.iloc[-5:-1]  # last 4 before current
-    ranges = (recent["high"] - recent["low"]).abs()
-    bodies = (recent["close"] - recent["open"]).abs()
-    if len(ranges) < 4:
+    if len(recent) < 4:
         return None
 
+    ranges = (recent["high"] - recent["low"]).abs()
+    bodies = (recent["close"] - recent["open"]).abs()
     avg_range = float(ranges.mean())
     avg_body = float(bodies.mean())
 
-    # want relatively small-body consolidation, not momentum bars
-    if avg_body / (avg_range + 1e-9) > 0.7:
+    # Want relatively small-body consolidation vs total range
+    if avg_range <= 0 or avg_body / avg_range > 0.7:
         return None
 
+    # 4) MACD + RSI (stricter continuation rules)
     macd_line, _, _ = macd(d1["close"])
     macd1_dir = macd_slope(macd_line)
+    macd_val = float(macd_line.iloc[-1])
     rsi1 = float(d1["rsi"].iloc[-1])
 
-    ema10 = d1["ema10"].iloc[-1]
-    ema21 = d1["ema21"].iloc[-1]
-    ema50 = d1["ema50"].iloc[-1]
+    ema10_1h = float(d1["ema10"].iloc[-1])
+    ema21_1h = float(d1["ema21"].iloc[-1])
+    ema50_1h = float(d1["ema50"].iloc[-1])
 
-    # 4H S/R (to avoid trading straight into opposite level)
+    # 5) 1H swing structure: we only want continuation, not hidden reversal
+    struct1h = swing_structure_1h(d1["close"], look=2)
+    hi_trend = struct1h["high_trend"]
+    lo_trend = struct1h["low_trend"]
+
+    # 6) 4H S/R map for distance filter
     highs4 = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=4)
     lows4  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=4)
-    res4, _ = nearest_level(highs4, c, "above")
-    sup4, _ = nearest_level(lows4,  c, "below")
 
-    # LONG continuation in uptrend
+    # Helper: distance to nearest 4H level on the opposite side of the trade
+    def sr_distance_ok_for_short(price: float) -> bool:
+        if not lows4:
+            return True
+        sup_level, _ = nearest_level(lows4, price, "below")
+        if not sup_level:
+            return True
+        # require price to be at least MIN_B2_SR_ATR_MULT * ATR away from support
+        dist = price - sup_level
+        return dist >= MIN_B2_SR_ATR_MULT * atr1
+
+    def sr_distance_ok_for_long(price: float) -> bool:
+        if not highs4:
+            return True
+        res_level, _ = nearest_level(highs4, price, "above")
+        if not res_level:
+            return True
+        dist = res_level - price
+        return dist >= MIN_B2_SR_ATR_MULT * atr1
+
+    # 7) Optional volume behaviour (light flag, not heavy distribution)
+    vol = d1["vol"]
+    if len(vol) >= 20:
+        flag_vol_avg = float(vol.iloc[-5:-1].mean())
+        prior_vol_avg = float(vol.iloc[-15:-5].mean())
+        trigger_vol = float(vol.iloc[-1])
+        # flag volume should be lighter than recent average,
+        # trigger candle volume should not be dead
+        if prior_vol_avg > 0:
+            if flag_vol_avg > prior_vol_avg * 1.1:
+                return None
+            if trigger_vol < flag_vol_avg * 0.7:
+                return None
+
+    # =============== LONG CONTINUATION (4H uptrend) ===============
     if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        # 1H should not be hard downtrend
-        if trend1 == "down":
-            return None
+        # Pullback into EMA10/21 zone, above EMA50
+        in_ema_zone = (ema21_1h * 0.995 <= c <= ema10_1h * 1.005) and (c > ema50_1h)
+        # Continuation MACD/RSI
+        macd_ok = (macd_val > 0) and (macd1_dir == "up")
+        rsi_ok = 45 <= rsi1 <= 65
+        # Structural HH/HL: we don't want recent high/low trends pointing down
+        struct_ok = hi_trend in ("up", "flat") and lo_trend in ("up", "flat")
+        # Not too close to big 4H resistance
+        sr_ok = sr_distance_ok_for_long(c)
 
-        # pullback into EMA10/21 zone, not breaking EMA50
-        if ema21 * 0.995 <= c <= ema10 * 1.005 and c > ema50:
-            # avoid long directly under 4H resistance (<0.7% distance)
-            if res4 and pct_distance(c, res4) < 0.7:
-                return None
-
-            # momentum filter
-            if not (macd1_dir in ("up", "flat") and 40 <= rsi1 <= 70):
-                return None
-
-            # require bullish pattern in last candle
+        if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok:
             if not (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
                 return None
 
-            entry_low = min(last["low"], ema21)
-            entry_high = max(last["close"], ema10)
+            entry_low = min(last["low"], ema21_1h)
+            entry_high = max(last["close"], ema10_1h)
             entry_mid = (entry_low + entry_high) / 2.0
 
-            sl_price = min(last["low"], ema50 * 0.997)
-            price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
+            sl_price = min(last["low"], ema50_1h * 0.997)
+            price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100.0
             if price_risk_pct <= MAX_PRICE_RISK_PCT:
                 return {
                     "side": "LONG",
                     "entry_low": entry_low,
                     "entry_high": entry_high,
                     "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H uptrend (mini-flag)",
+                    "note": "B2_TREND_CONT · EMA pullback in 4H uptrend (mini-flag, v2.1)"
                 }
 
-    # SHORT continuation in downtrend
+    # =============== SHORT CONTINUATION (4H downtrend) ===============
     if trend4 == "down":
-        if trend1 == "up":
-            return None
+        # Pullback into EMA10/21 zone, below EMA50
+        in_ema_zone = (ema21_1h * 1.005 >= c >= ema10_1h * 0.995) and (c < ema50_1h)
+        macd_ok = (macd_val < 0) and (macd1_dir == "down")
+        rsi_ok = 35 <= rsi1 <= 55
+        struct_ok = hi_trend in ("down", "flat") and lo_trend in ("down", "flat")
+        sr_ok = sr_distance_ok_for_short(c)
 
-        if ema21 * 1.005 >= c >= ema10 * 0.995 and c < ema50:
-            # avoid short directly on top of 4H support
-            if sup4 and pct_distance(c, sup4) < 0.7:
-                return None
-
-            if not (macd1_dir in ("down", "flat") and 30 <= rsi1 <= 60):
-                return None
-
+        if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok:
             if not (is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last)):
                 return None
 
-            entry_high = max(last["high"], ema21)
-            entry_low = min(last["close"], ema10)
+            entry_high = max(last["high"], ema21_1h)
+            entry_low = min(last["close"], ema10_1h)
             entry_mid = (entry_low + entry_high) / 2.0
 
-            sl_price = max(last["high"], ema50 * 1.003)
-            price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
+            sl_price = max(last["high"], ema50_1h * 1.003)
+            price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100.0
             if price_risk_pct <= MAX_PRICE_RISK_PCT:
                 return {
                     "side": "SHORT",
                     "entry_low": entry_low,
                     "entry_high": entry_high,
                     "sl": sl_price,
-                    "note": "B2_TREND_CONT · EMA pullback in 4H downtrend (mini-flag)",
+                    "note": "B2_TREND_CONT · EMA pullback in 4H downtrend (mini-flag, v2.1)"
                 }
 
     return None
-
 
 # ---------- B3: Major S/R Bounce + Pattern ----------
 def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
@@ -889,8 +938,8 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
         raw_row["note"] = sig_b1["note"]
 
     # ---- B2: Trend continuation
-    if signal is None:
-        sig_b2 = b2_trend_continuation(symbol, d4, d1, swings4, trend4, trend1, regime, dom_bias)
+     if signal is None:
+        sig_b2 = b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias)
         if sig_b2:
             signal = sig_b2
             raw_row["note"] = sig_b2["note"]
