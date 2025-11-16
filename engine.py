@@ -9,7 +9,7 @@
 #       B3/S1/S2: Major S/R Bounce + Pattern + Trendline
 #           • S1: 4H S/R bounce + pattern + StochRSI
 #           • S2: 4H Trendline wick-to-wick bounce + StochRSI (hardened)
-#           • (S5 is execution hint only; tagged in note)
+#           • (S5 is execution hint; tagged in note on strong S4)
 #
 #  - BTC regime filter (risk_on / risk_off / neutral)
 #  - Optional dominance bias (BTCDOM + USDTDOM via env)
@@ -61,7 +61,10 @@ S2_REJECTION_ATR_BODY_PCT = float(os.getenv("S2_REJECTION_ATR_BODY_PCT", "20.0")
 S2_VOL_SPIKE_MULT         = float(os.getenv("S2_VOL_SPIKE_MULT", "1.10"))        # vol spike multiplier (vs avg20)
 S2_MACD_ZERO_LOOKBACK     = int(os.getenv("S2_MACD_ZERO_LOOKBACK", "30"))        # MACD zero-line rollover lookback
 S2_MIDRANGE_REJECT_PCT    = float(os.getenv("S2_MIDRANGE_REJECT_PCT", "30.0"))   # reject if price sits in middle 40% of 20-bar range
+
+# TL config
 TL_TOUCH_TOL_PCT          = float(os.getenv("TL_TOUCH_TOL_PCT", "0.4"))          # % tolerance around TL for "touch"
+TL_USE_WICKS              = int(os.getenv("TL_USE_WICKS", "0"))                  # 1 = wick-to-wick, 0 = close-to-close
 
 # StochRSI config (applied to RSI series)
 STOCH_KLEN  = int(os.getenv("STOCH_KLEN", "14"))  # window for %K (on RSI)
@@ -562,32 +565,42 @@ def vol_spike(vol_series: pd.Series, idx: int, window: int = 20, mult: float = 1
     return v >= base * mult
 
 
-# ---------- Trendline helpers (wick-to-wick, simple 2-point) ----------
+# ---------- Trendline helpers ----------
 def trendline_value_at_current(df4: pd.DataFrame, mode: str = "up"):
     """
-    Very simple TL projection (wick-to-wick on 4H closes):
-      - For 'up': use last two swing lows (close-based)
-      - For 'down': use last two swing highs
-    Return projected price at "next" bar index as scalar (float) or None if not enough points.
+    Simple TL projection (swing-to-swing):
+      - If TL_USE_WICKS==1:
+          • 'up'  uses 4H lows (wick-to-wick across swing lows)
+          • 'down' uses 4H highs (wick-to-wick across swing highs)
+      - Else:
+          • uses 4H closes (close-to-close swing points)
+    Returns (projected_price, touches) or (None, 0).
     """
-    swings = detect_swings(df4["close"], look=3)
+    if TL_USE_WICKS:
+        src = df4["low"] if mode == "up" else df4["high"]
+    else:
+        src = df4["close"]
+
+    swings = detect_swings(src, look=3)
     if not swings or len(swings) < 2:
         return None, 0
+
     if mode == "up":
         pts = [(i, p) for (i, p, t) in swings if t == "low"]
     else:
         pts = [(i, p) for (i, p, t) in swings if t == "high"]
+
     if len(pts) < 2:
-        return None, 0
-    # count "touches"
+        return None, len(pts)
+
     touches = len(pts)
     a_idx, a_p = pts[-2]
     b_idx, b_p = pts[-1]
     if b_idx == a_idx:
         return None, touches
+
     slope = (b_p - a_p) / (b_idx - a_idx)
-    # project to next index (one 4H step ahead of last candle)
-    proj_idx = len(df4)  # one after last index
+    proj_idx = len(df4)  # one bar ahead of last
     tl_price = b_p + slope * (proj_idx - b_idx)
     return float(tl_price), touches
 
@@ -598,7 +611,6 @@ def is_trendline_touch_1h(d1: pd.DataFrame, tl_price: float, side: str, tol_pct:
         return False
     last = d1.iloc[-1]
     if side == "LONG":
-        # wick/tag below within tolerance and close green preferred
         return (last["low"] <= tl_price * (1 + tol_pct / 100.0)) and (last["high"] >= tl_price * (1 - tol_pct / 100.0))
     else:
         return (last["high"] >= tl_price * (1 - tol_pct / 100.0)) and (last["low"] <= tl_price * (1 + tol_pct / 100.0))
@@ -641,10 +653,8 @@ def not_midrange(close: pd.Series, side: str, lookback: int = 20, midband_pct: f
     low_band_hi = lo + band * (midband_pct / 100.0)
     high_band_lo = hi - band * (midband_pct / 100.0)
     if side == "SHORT":
-        # reject if sitting near lows (i.e., below low_band_hi)
         return last > low_band_hi
     else:
-        # reject if sitting near highs (i.e., above high_band_lo)
         return last < high_band_lo
 
 
@@ -655,7 +665,6 @@ def pullback_from_extreme_ok(close: pd.Series, side: str, atr_val: float, mult: 
     recent = close.iloc[-lookback:]
     last = float(close.iloc[-1])
     if side == "SHORT":
-        # ensure distance from recent low >= mult*ATR (avoid shorting into lows)
         recent_low = float(recent.min())
         return (last - recent_low) >= mult * atr_val
     else:
@@ -766,6 +775,12 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
                 if price_risk_pct <= MAX_PRICE_RISK_PCT:
                     note = f"B1_BREAK_RETEST · {res_touch}x resistance @ {res_level:.4f} · S4"
+                    # S5 hint: strong break candle had volume spike → consider 50/50 execution
+                    try:
+                        if vol_spike(d1["vol"], len(d1)-2, 20, 1.15):
+                            note += " · S5_SPLIT_50_50"
+                    except Exception:
+                        pass
                     return {"side": "LONG", "entry_low": entry_low, "entry_high": entry_high, "sl": sl_price, "note": note}
 
     # SHORT
@@ -787,6 +802,12 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
                 if price_risk_pct <= MAX_PRICE_RISK_PCT:
                     note = f"B1_BREAK_RETEST · {sup_touch}x support @ {sup_level:.4f} · S4"
+                    # S5 hint: strong break candle had volume spike → consider 50/50 execution
+                    try:
+                        if vol_spike(d1["vol"], len(d1)-2, 20, 1.15):
+                            note += " · S5_SPLIT_50_50"
+                    except Exception:
+                        pass
                     return {"side": "SHORT", "entry_low": entry_low, "entry_high": entry_high, "sl": sl_price, "note": note}
 
     return None
@@ -821,7 +842,6 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     bodies = (recent["close"] - recent["open"]).abs()
     avg_range = float(ranges.mean())
     avg_body = float(bodies.mean())
-    # want relatively small bodies vs range; reject grinding too small too
     if avg_range <= 0 or avg_body / avg_range > 0.6:
         return None
 
@@ -876,8 +896,6 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         rsi_ok = 45 <= rsi1 <= 65
         struct_ok = struct1h["high_trend"] in ("up", "flat") and struct1h["low_trend"] in ("up", "flat")
         sr_ok = sr_distance_ok_for_long(c)
-
-        # extra guardrails (reuse S2 ideas)
         not_mid = not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT)
 
         if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok and not_mid:
@@ -906,7 +924,6 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         rsi_ok = 35 <= rsi1 <= 55
         struct_ok = struct1h["high_trend"] in ("down", "flat") and struct1h["low_trend"] in ("down", "flat")
         sr_ok = sr_distance_ok_for_short(c)
-
         not_mid = not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT)
 
         if in_ema_zone and macd_ok and rsi_ok and struct_ok and sr_ok and not_mid:
@@ -988,7 +1005,6 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 ema21_1h = float(d1["ema21"].iloc[-1])
                 ema50_1h = float(d1["ema50"].iloc[-1])
                 if struct1h["low_trend"] != "down" and (last["close"] >= ema21_1h and ema21_1h >= ema50_1h * 0.995):
-                    # Momentum + StochRSI
                     if (macd1_dir == "up" and macd_val >= 0 and 38 <= rsi1 <= 60 and stoch_long_ok and
                         micro_ok(PRICE_EXCHANGE, symbol, "LONG")):
                         entry_low = min(last["low"], sup_level)
@@ -1051,28 +1067,21 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         tl_up, tl_touches = trendline_value_at_current(d4, mode="up")
         if tl_up:
             if is_trendline_touch_1h(d1, tl_up, "LONG", TL_TOUCH_TOL_PCT):
-                # strong rejection candle vs ATR
                 if atr1 and atr1 > 0:
                     o, h, l, c, body, rng, uw, lw, _ = candle_stats(last)
                     body_atr_pct = body / atr1 * 100.0 if atr1 else 0.0
                     if body_atr_pct < S2_REJECTION_ATR_BODY_PCT:
                         return None
-                # MACD rollover from below zero recently
                 if macd_zero_cross_recent(macd_line, S2_MACD_ZERO_LOOKBACK) not in ("up",):
                     return None
-                # must pull back at least 1 ATR from recent high before TL touch
                 if not pullback_from_extreme_ok(d1["close"], "LONG", atr1, S2_MIN_ATR_PULLBACK_MULT, 20):
                     return None
-                # Not near highs (avoid longing into highs)
                 if not not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT):
                     return None
-                # Volume confirm on rejection candle
                 if not vol_spike(d1["vol"], len(d1)-1, 20, S2_VOL_SPIKE_MULT):
                     return None
-                # Pattern: engulf/pin/inside
                 if not (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
                     return None
-                # StochRSI + micro
                 if not (stoch_long_ok and micro_ok(PRICE_EXCHANGE, symbol, "LONG")):
                     return None
 
@@ -1102,10 +1111,8 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                         return None
                 if macd_zero_cross_recent(macd_line, S2_MACD_ZERO_LOOKBACK) not in ("down",):
                     return None
-                # must pull back at least 1 ATR from recent low (avoid short into lows)
                 if not pullback_from_extreme_ok(d1["close"], "SHORT", atr1, S2_MIN_ATR_PULLBACK_MULT, 20):
                     return None
-                # Not near lows for short
                 if not not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT):
                     return None
                 if not vol_spike(d1["vol"], len(d1)-1, 20, S2_VOL_SPIKE_MULT):
