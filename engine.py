@@ -1,7 +1,11 @@
 # ==========================================================
 #  engine.py — Bernard System v2.4 (Pure Bernard Logic)
 #
-#  - 3 Bernard families (now tagged S1..S5 for notes):
+#  Modes:
+#    BALANCED (default)  — sane filters, good frequency
+#    TIGHT               — A+ only: stricter regime/midrange/ATR/1H-trend guards
+#
+#  - 3 Bernard families (tagged S1..S5 in notes):
 #       B1/S3/S4:
 #           • S3: Pure Breakout/Breakdown (body + volume, no retest)
 #           • S4: Breakout + Retest at strong 4H S/R
@@ -13,7 +17,7 @@
 #
 #  - BTC regime filter (risk_on / risk_off / neutral)
 #  - Optional dominance bias (BTCDOM + USDTDOM via env)
-#  - Structure-based SL, price risk capped at 5%
+#  - Structure-based SL, price risk capped (MAX_PRICE_RISK_PCT)
 #  - TP = 1R / 2R / 3R
 #  - Safe for Koyeb free plan (4H + 1H; optional 15m micro)
 #  - Fully compatible with Worker & Supabase contracts
@@ -56,19 +60,24 @@ DOM_USDTDOM_SYMBOL  = os.getenv("DOM_USDTDOM_SYMBOL", "").strip()
 USE_15M_MICRO       = int(os.getenv("USE_15M_MICRO", "0"))
 
 # S2 hardening (override via env if needed)
-S2_MIN_ATR_PULLBACK_MULT  = float(os.getenv("S2_MIN_ATR_PULLBACK_MULT", "1.0"))  # need >= 1 ATR pullback from recent extreme before TL touch
-S2_REJECTION_ATR_BODY_PCT = float(os.getenv("S2_REJECTION_ATR_BODY_PCT", "20.0"))# min body% of ATR on rejection candle
-S2_VOL_SPIKE_MULT         = float(os.getenv("S2_VOL_SPIKE_MULT", "1.10"))        # vol spike multiplier (vs avg20)
-S2_MACD_ZERO_LOOKBACK     = int(os.getenv("S2_MACD_ZERO_LOOKBACK", "30"))        # MACD zero-line rollover lookback
-S2_MIDRANGE_REJECT_PCT    = float(os.getenv("S2_MIDRANGE_REJECT_PCT", "30.0"))   # reject if price sits in middle 40% of 20-bar range
+S2_MIN_ATR_PULLBACK_MULT  = float(os.getenv("S2_MIN_ATR_PULLBACK_MULT", "1.0"))   # need >= 1 ATR pullback before TL touch
+S2_REJECTION_ATR_BODY_PCT = float(os.getenv("S2_REJECTION_ATR_BODY_PCT", "20.0")) # min body% of ATR on rejection candle
+S2_VOL_SPIKE_MULT         = float(os.getenv("S2_VOL_SPIKE_MULT", "1.10"))         # vol spike multiplier (vs avg20)
+S2_MACD_ZERO_LOOKBACK     = int(os.getenv("S2_MACD_ZERO_LOOKBACK", "30"))         # MACD zero-line rollover lookback
+S2_MIDRANGE_REJECT_PCT    = float(os.getenv("S2_MIDRANGE_REJECT_PCT", "30.0"))    # reject if price sits in sideway mid-band
 
 # TL config
-TL_TOUCH_TOL_PCT          = float(os.getenv("TL_TOUCH_TOL_PCT", "0.4"))          # % tolerance around TL for "touch"
-TL_USE_WICKS              = int(os.getenv("TL_USE_WICKS", "0"))                  # 1 = wick-to-wick, 0 = close-to-close
+TL_TOUCH_TOL_PCT          = float(os.getenv("TL_TOUCH_TOL_PCT", "0.4"))           # % tolerance around TL for "touch"
+TL_USE_WICKS              = int(os.getenv("TL_USE_WICKS", "0"))                   # 1 = wick-to-wick, 0 = close-to-close
 
 # StochRSI config (applied to RSI series)
 STOCH_KLEN  = int(os.getenv("STOCH_KLEN", "14"))  # window for %K (on RSI)
 STOCH_DLEN  = int(os.getenv("STOCH_DLEN", "3"))   # smoothing for %D
+
+# --- Mode toggle ---
+BERNARD_MODE = os.getenv("BERNARD_MODE", "BALANCED").upper()  # BALANCED | TIGHT
+def is_tight() -> bool:
+    return BERNARD_MODE == "TIGHT"
 
 WATCHLIST = [
     s.strip()
@@ -83,10 +92,11 @@ WATCHLIST = [
 ]
 
 # Max allowed price risk (in %) between entry_mid and SL
-MAX_PRICE_RISK_PCT = 5.0
+# (You can tighten via ENV to 3.0 in TIGHT mode, but we keep the variable here.)
+MAX_PRICE_RISK_PCT = float(os.getenv("MAX_PRICE_RISK_PCT", "5.0"))
 
 # Minimum distance (in ATR multiples) from B2 entry price to nearest 4H S/R
-MIN_B2_SR_ATR_MULT = 1.5
+MIN_B2_SR_ATR_MULT = float(os.getenv("MIN_B2_SR_ATR_MULT", "1.5"))
 
 
 # ---------- Utils ----------
@@ -715,10 +725,19 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     rsi1 = float(d1["rsi"].iloc[-1])
     atr_val = float(d1["atr"].iloc[-1]) if "atr" in d1.columns else None
 
+    # Optional ATR% sanity: block ultra-dead markets from S3 in TIGHT mode
+    if is_tight() and atr_val:
+        atr_pct = (atr_val / c1) * 100.0 if c1 > 0 else None
+        if atr_pct is not None and atr_pct < 0.5:
+            return None
+
     # ----- S3 PURE BREAK (no retest; require volume spike) -----
     if atr_val and len(d1) >= 3:
-        # LONG break above resistance
-        if regime != "risk_off" and trend4 == "up" and dom_bias != "btc_pump_usdt_dump" and res_level:
+        # LONG break above resistance (TIGHT: regime must be risk_on)
+        if ((regime == "risk_on") if is_tight() else (regime != "risk_off")) \
+           and trend4 == "up" and dom_bias != "btc_pump_usdt_dump" and res_level:
+            if is_tight() and not not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT):
+                return None
             if float(prev["close"]) > res_level * 1.001 and float(prev["open"]) <= res_level:
                 strong = is_strong_break_candle(d1.iloc[-3], prev, res_level, "up", 40, atr_val)
                 if strong and vol_spike(d1["vol"], len(d1)-2, 20, 1.2):
@@ -736,8 +755,10 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                             "note": f"S3_PURE_BREAK · {res_touch}x resistance @ {res_level:.4f}"
                         }
 
-        # SHORT break below support
-        if trend4 == "down" and sup_level:
+        # SHORT break below support (TIGHT: regime must be risk_off)
+        if ((regime == "risk_off") if is_tight() else True) and trend4 == "down" and sup_level:
+            if is_tight() and not not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT):
+                return None
             if float(prev["close"]) < sup_level * 0.999 and float(prev["open"]) >= sup_level:
                 strong = is_strong_break_candle(d1.iloc[-3], prev, sup_level, "down", 40, atr_val)
                 if strong and vol_spike(d1["vol"], len(d1)-2, 20, 1.2):
@@ -759,6 +780,8 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     # LONG
     if regime != "risk_off" and trend4 == "up" and dom_bias != "btc_pump_usdt_dump":
         if res_level:
+            if is_tight() and not not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT):
+                return None
             prev_close = float(prev["close"])
             if prev_close > res_level * 1.001 and float(prev["open"]) <= res_level:
                 if not is_strong_break_candle(d1.iloc[-3], prev, res_level, "up", 40, atr_val):
@@ -786,6 +809,8 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     # SHORT
     if trend4 == "down":
         if sup_level:
+            if is_tight() and not not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT):
+                return None
             prev_close = float(prev["close"])
             if prev_close < sup_level * 0.999 and float(prev["open"]) >= sup_level:
                 if not is_strong_break_candle(d1.iloc[-3], prev, sup_level, "down", 40, atr_val):
@@ -855,6 +880,7 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     ema50_1h = float(d1["ema50"].iloc[-1])
 
     struct1h = swing_structure_1h(d1["close"], look=2)
+    trend1_local = classify_trend(d1.close, d1.ema10, d1.ema21, d1.ema50, d1.sma200)
 
     highs4 = cluster_levels(swings4, "high", tolerance_pct=0.4, min_touches=4)
     lows4  = cluster_levels(swings4, "low",  tolerance_pct=0.4, min_touches=4)
@@ -890,10 +916,12 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 return None
 
     # ----- LONG continuation -----
-    if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
+    if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump" \
+       and (trend1_local == "up" if is_tight() else True):
+
         in_ema_zone = (ema21_1h * 0.995 <= c <= ema10_1h * 1.005) and (c > ema50_1h)
         macd_ok = (macd_val > 0) and (macd1_dir == "up")
-        rsi_ok = 45 <= rsi1 <= 65
+        rsi_ok = (48 <= rsi1 <= 62) if is_tight() else (45 <= rsi1 <= 65)
         struct_ok = struct1h["high_trend"] in ("up", "flat") and struct1h["low_trend"] in ("up", "flat")
         sr_ok = sr_distance_ok_for_long(c)
         not_mid = not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT)
@@ -918,10 +946,10 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 }
 
     # ----- SHORT continuation -----
-    if trend4 == "down":
+    if trend4 == "down" and (trend1_local == "down" if is_tight() else True):
         in_ema_zone = (ema21_1h * 1.005 >= c >= ema10_1h * 0.995) and (c < ema50_1h)
         macd_ok = (macd_val < 0) and (macd1_dir == "down")
-        rsi_ok = 35 <= rsi1 <= 55
+        rsi_ok = (38 <= rsi1 <= 52) if is_tight() else (35 <= rsi1 <= 55)
         struct_ok = struct1h["high_trend"] in ("down", "flat") and struct1h["low_trend"] in ("down", "flat")
         sr_ok = sr_distance_ok_for_short(c)
         not_mid = not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT)
@@ -993,6 +1021,10 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     # ==================== S1: S/R bounce (LONG) ====================
     if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
+            # Tight-mode: avoid bottom-catch in risk_off regime
+            if is_tight() and regime == "risk_off":
+                return None
+
             dbl = detect_double(swings1, "bottom")
             sfp_ok = detect_sfp_low(d1, swings1)
             pattern_ok = (
@@ -1029,6 +1061,10 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 
     # ==================== S1: S/R bounce (SHORT) ====================
     if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7 and trend4 != "up":
+        # Tight-mode: avoid top-fade in risk_on regime
+        if is_tight() and regime == "risk_on":
+            return None
+
         dbl = detect_double(swings1, "top")
         sfp_ok = detect_sfp_high(d1, swings1)
         pattern_ok = (
