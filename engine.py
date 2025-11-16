@@ -1,9 +1,11 @@
 # ==========================================================
-#  engine.py — Bernard System v2.3 (Final Framework Tally) — POLISHED
+#  engine.py — Bernard System v2.4 (Final Framework Tally)
 #
 #  Strategies (as per Framework):
 #    S1: Support/Resistance + StochRSI   -> in B3 (S/R bounce + 1H StochRSI gate)
 #    S2: Trendline + StochRSI            -> 4H wick-to-wick trendline + 1H touch + pattern + StochRSI (in B3)
+#          v2.4 hardening: ATR pullback, MACD zero-line rollover, strong rejection body,
+#          volume spike, not near extremes, no grind touches, optional EMA confluence
 #    S3: Pure Breakout/Breakdown         -> no retest, strong body + volume spike (in B1 path)
 #    S4: Breakout + Retest               -> B1
 #    S5: 50/50 Breakout+Retest           -> hint in `note` (no schema change)
@@ -92,6 +94,19 @@ MICRO_USE_PATTERN   = int(os.getenv("MICRO_USE_PATTERN", "1"))
 ENABLE_PURE_BREAKOUT  = int(os.getenv("ENABLE_PURE_BREAKOUT", "1"))
 BREAK_BODY_ATR_MIN    = float(os.getenv("BREAK_BODY_ATR_MIN", "40"))
 BREAK_VOL_SPIKE_MULT  = float(os.getenv("BREAK_VOL_SPIKE_MULT", "1.2"))
+
+# ----- S2 (Trendline Bounce) hardening (v2.4) -----
+USE_S2_UPGRADE                = int(os.getenv("USE_S2_UPGRADE", "1"))  # ON by default
+S2_MIN_ATR_PULLBACK_MULT      = float(os.getenv("S2_MIN_ATR_PULLBACK_MULT", "1.0"))   # pullback >= 1*ATR
+S2_REJ_BODY_ATR_MIN_PCT       = float(os.getenv("S2_REJ_BODY_ATR_MIN_PCT", "20.0"))   # rejection body >= 20% ATR
+S2_VOL_SPIKE_MULT             = float(os.getenv("S2_VOL_SPIKE_MULT", "1.1"))          # vol spike vs avg20
+S2_RANGE_WINDOW               = int(os.getenv("S2_RANGE_WINDOW", "50"))               # recent swing window for extremes
+S2_EXTREME_BAND               = float(os.getenv("S2_EXTREME_BAND", "0.30"))           # bottom/top 30% is "near lows/highs"
+S2_SIDEWAYS_N                 = int(os.getenv("S2_SIDEWAYS_N", "6"))                   # last N candles for grind test
+S2_SIDEWAYS_BODYR_MAX         = float(os.getenv("S2_SIDEWAYS_BODYR_MAX", "0.35"))      # avg body/range threshold
+S2_SIDEWAYS_AVGR_ATR_MAX      = float(os.getenv("S2_SIDEWAYS_AVGR_ATR_MAX", "0.6"))    # avg range < 0.6*ATR -> grind
+S2_MACD_ZERO_LOOKBACK         = int(os.getenv("S2_MACD_ZERO_LOOKBACK", "10"))          # recent MACD zero-line cross
+S2_REQUIRE_EMA_CONFLUENCE     = int(os.getenv("S2_REQUIRE_EMA_CONFLUENCE", "0"))       # optional: require 4H EMA21/50 confluence
 
 # ---------- Utils ----------
 def log(msg: str):
@@ -192,15 +207,80 @@ def macd_slope(series: pd.Series) -> str:
         return "down"
     return "flat"
 
-def stoch_cross_up(k: pd.Series, d: pd.Series, oversold=20.0) -> bool:
-    if len(k) < 2 or len(d) < 2:
-        return False
-    return (k.iloc[-2] < d.iloc[-2] and k.iloc[-2] < oversold) and (k.iloc[-1] > d.iloc[-1])
+# ---------- S2 upgrade helpers ----------
+def recent_swing_extremes(series: pd.Series, window: int):
+    if len(series) < window:
+        window = len(series)
+    if window <= 1:
+        return float(series.iloc[-1]), float(series.iloc[-1])
+    window_slice = series.iloc[-window:]
+    return float(window_slice.max()), float(window_slice.min())
 
-def stoch_cross_down(k: pd.Series, d: pd.Series, overbought=80.0) -> bool:
-    if len(k) < 2 or len(d) < 2:
+def struct_position_percent(price: float, hi: float, lo: float) -> float:
+    if hi <= lo:
+        return 0.5
+    return (price - lo) / (hi - lo)
+
+def macd_zero_rollover(macd_line: pd.Series, side: str, lookback: int) -> bool:
+    """
+    TRUE only if MACD recently crossed the zero-line in the *required* direction:
+    - SHORT: crossed from >0 to <0 within lookback
+    - LONG : crossed from <0 to >0 within lookback
+    """
+    if len(macd_line) < lookback + 1:
         return False
-    return (k.iloc[-2] > d.iloc[-2] and k.iloc[-2] > overbought) and (k.iloc[-1] < d.iloc[-1])
+    recent = macd_line.iloc[-(lookback+1):].values
+    for i in range(1, len(recent)):
+        prev, cur = recent[i-1], recent[i]
+        if side == "SHORT" and prev > 0 and cur < 0:
+            return True
+        if side == "LONG" and prev < 0 and cur > 0:
+            return True
+    return False
+
+def rejection_strength_ok(prev_row, last_row, side: str, atr_val: float, min_body_pct: float) -> bool:
+    """Require a strong rejection candle at touch: pattern + body >= min_body_pct% ATR."""
+    if not atr_val or atr_val <= 0:
+        return False
+    o, h, l, c, body, rng, uw, lw, _ = candle_stats(last_row)
+    body_ok = (body / atr_val * 100.0) >= min_body_pct
+    if side == "LONG":
+        pat = is_bull_engulf(prev_row, last_row) or is_bull_pin(last_row) or is_inside_bar(prev_row, last_row)
+    else:
+        pat = is_bear_engulf(prev_row, last_row) or is_bear_pin(last_row) or is_inside_bar(prev_row, last_row)
+    return pat and body_ok
+
+def vol_confirm_ok(vol: pd.Series, mult: float = 1.1) -> bool:
+    if len(vol) < 21:
+        return False
+    avg20 = float(vol.iloc[-21:-1].mean())
+    cur = float(vol.iloc[-1])
+    return avg20 > 0 and cur >= avg20 * mult
+
+def pullback_distance_ok(price: float, hi: float, lo: float, side: str, atr_val: float, mult: float) -> bool:
+    """Distance from nearest opposite extreme before TL touch must be >= ATR*mult."""
+    if not atr_val or atr_val <= 0:
+        return False
+    if side == "SHORT":
+        # Must be far enough above recent low
+        dist = price - lo
+    else:
+        # Must be far enough below recent high
+        dist = hi - price
+    return dist >= atr_val * mult
+
+def is_sideways_grind(d1: pd.DataFrame, atr1: float, N: int, bodyr_max: float, avgr_atr_max: float) -> bool:
+    """Reject TL touches during low-vol grinding."""
+    if len(d1) < N + 1 or not atr1 or atr1 <= 0:
+        return False
+    recent = d1.iloc[-N:]
+    ranges = (recent["high"] - recent["low"]).abs()
+    bodies = (recent["close"] - recent["open"]).abs()
+    avg_range = float(ranges.mean())
+    avg_body  = float(bodies.mean())
+    if avg_range <= 0:
+        return True
+    return (avg_body / avg_range <= bodyr_max) and (avg_range <= avgr_atr_max * atr1)
 
 # ---------- Swings & S/R ----------
 def detect_swings(series: pd.Series, look: int = 3):
@@ -610,6 +690,22 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
             if trigger_vol < flag_vol_avg * 0.7:
                 return None
 
+    # --- v2.4: avoid S2-like weak conditions bleeding into B2 entries
+    if USE_S2_UPGRADE:
+        recent_hi, recent_lo = recent_swing_extremes(d1["close"], S2_RANGE_WINDOW)
+        pos = struct_position_percent(c, recent_hi, recent_lo)
+        # reject longs into highs / shorts into lows
+        if trend4 == "up" and pos >= (1.0 - S2_EXTREME_BAND):
+            return None
+        if trend4 == "down" and pos <= S2_EXTREME_BAND:
+            return None
+        # reject grindy triggers
+        if is_sideways_grind(d1, atr1, S2_SIDEWAYS_N, S2_SIDEWAYS_BODYR_MAX, S2_SIDEWAYS_AVGR_ATR_MAX):
+            return None
+        # small volume confirm on trigger
+        if not vol_confirm_ok(vol, S2_VOL_SPIKE_MULT):
+            return None
+
     # LONG
     if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         in_ema_zone = (ema21_1h * 0.995 <= c <= ema10_1h * 1.005) and (c > ema50_1h)
@@ -690,7 +786,7 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 
     macd_line, _, _ = macd(d1["close"])
     macd1_dir = macd_slope(macd_line)
-    macd_val = float(macd_line.iloc[-1])  # FIXED
+    macd_val = float(macd_line.iloc[-1])
     rsi1 = float(d1["rsi"].iloc[-1])
     atr1 = float(d1["atr"].iloc[-1]) if "atr" in d1.columns else None
 
@@ -766,15 +862,45 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                             if sfp_ok: note += " · SFP_low"
                             long_note_core = note
 
-    # S2: Trendline bounce (uptrend support line)
+    # S2: Trendline bounce (uptrend support line) — hardened v2.4
     if long_candidate is None and USE_TRENDLINE_RULE and trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         tl_val, confirmed = trendline_value_at_current(d4, mode="up")
         if tl_val and is_trendline_touch_1h(d1, tl_val, side="LONG", tol_pct=TL_TOUCH_TOL_PCT):
             prev = d1.iloc[-2]; last = d1.iloc[-1]
-            if is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last):
+
+            okay = True
+            if USE_S2_UPGRADE:
+                # 1) not near recent highs
+                recent_hi, recent_lo = recent_swing_extremes(d1["close"], S2_RANGE_WINDOW)
+                pos = struct_position_percent(float(last["close"]), recent_hi, recent_lo)
+                if pos >= (1.0 - S2_EXTREME_BAND):
+                    okay = False
+                # 2) strong rejection candle
+                if okay and not rejection_strength_ok(prev, last, "LONG", atr1, S2_REJ_BODY_ATR_MIN_PCT):
+                    okay = False
+                # 3) MACD zero-line rollover up
+                if okay and not macd_zero_rollover(macd_line, "LONG", S2_MACD_ZERO_LOOKBACK):
+                    okay = False
+                # 4) pullback distance from recent high >= ATR*mult
+                if okay and not pullback_distance_ok(float(last["close"]), recent_hi, recent_lo, "LONG", atr1, S2_MIN_ATR_PULLBACK_MULT):
+                    okay = False
+                # 5) reject sideways grind touches
+                if okay and is_sideways_grind(d1, atr1, S2_SIDEWAYS_N, S2_SIDEWAYS_BODYR_MAX, S2_SIDEWAYS_AVGR_ATR_MAX):
+                    okay = False
+                # 6) volume confirmation
+                if okay and not vol_confirm_ok(d1["vol"], S2_VOL_SPIKE_MULT):
+                    okay = False
+                # 7) optional EMA21/50 4H confluence
+                if okay and S2_REQUIRE_EMA_CONFLUENCE:
+                    ema21_4h = float(d4["ema21"].iloc[-1]); ema50_4h = float(d4["ema50"].iloc[-1])
+                    tl_confluence = (tl_val >= min(ema21_4h, ema50_4h)*0.995 and tl_val <= max(ema21_4h, ema50_4h)*1.005)
+                    if not tl_confluence:
+                        okay = False
+
+            if okay and (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
                 if stoch_long_ok and micro_ok("LONG"):
                     long_candidate = ("TL", tl_val, 3 if confirmed else 2, None, None)
-                    long_note_core = f"S2_TRENDLINE_BOUNCE · {'3x' if confirmed else '2x'} touches (wick-to-wick)"
+                    long_note_core = f"S2_TRENDLINE_BOUNCE · {'3x' if confirmed else '2x'} touches (wick-to-wick) · v2.4"
 
     if long_candidate:
         typ, lvl, touches, dbl, sfp_ok = long_candidate
@@ -783,7 +909,6 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         entry_high = max(last["close"], ref_level * 1.001)
         entry_mid  = (entry_low + entry_high) / 2.0
         sl_price   = min(last["low"], ref_level * 0.996)
-        # Optional: ensure ≥ ~1*ATR gap to 4H resistance
         if atr1 and highs:
             nearest_res, _ = nearest_level(highs, float(last["close"]), "above")
             if nearest_res and (nearest_res - float(last["close"])) < atr1:
@@ -814,15 +939,45 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                         if sfp_ok: note += " · SFP_high"
                         short_note_core = note
 
-    # S2 mirror: downtrend line (resistance)
+    # S2 mirror: downtrend line (resistance) — hardened v2.4
     if short_candidate is None and USE_TRENDLINE_RULE and trend4 != "up":
         tl_val, confirmed = trendline_value_at_current(d4, mode="down")
         if tl_val and is_trendline_touch_1h(d1, tl_val, side="SHORT", tol_pct=TL_TOUCH_TOL_PCT):
             prev = d1.iloc[-2]; last = d1.iloc[-1]
-            if is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last):
+
+            okay = True
+            if USE_S2_UPGRADE:
+                # 1) not near recent lows
+                recent_hi, recent_lo = recent_swing_extremes(d1["close"], S2_RANGE_WINDOW)
+                pos = struct_position_percent(float(last["close"]), recent_hi, recent_lo)
+                if pos <= S2_EXTREME_BAND:
+                    okay = False
+                # 2) strong rejection candle
+                if okay and not rejection_strength_ok(prev, last, "SHORT", atr1, S2_REJ_BODY_ATR_MIN_PCT):
+                    okay = False
+                # 3) MACD zero-line rollover down
+                if okay and not macd_zero_rollover(macd_line, "SHORT", S2_MACD_ZERO_LOOKBACK):
+                    okay = False
+                # 4) pullback distance from recent low >= ATR*mult
+                if okay and not pullback_distance_ok(float(last["close"]), recent_hi, recent_lo, "SHORT", atr1, S2_MIN_ATR_PULLBACK_MULT):
+                    okay = False
+                # 5) reject sideways grind touches
+                if okay and is_sideways_grind(d1, atr1, S2_SIDEWAYS_N, S2_SIDEWAYS_BODYR_MAX, S2_SIDEWAYS_AVGR_ATR_MAX):
+                    okay = False
+                # 6) volume confirmation
+                if okay and not vol_confirm_ok(d1["vol"], S2_VOL_SPIKE_MULT):
+                    okay = False
+                # 7) optional EMA21/50 4H confluence
+                if okay and S2_REQUIRE_EMA_CONFLUENCE:
+                    ema21_4h = float(d4["ema21"].iloc[-1]); ema50_4h = float(d4["ema50"].iloc[-1])
+                    tl_confluence = (tl_val >= min(ema21_4h, ema50_4h)*0.995 and tl_val <= max(ema21_4h, ema50_4h)*1.005)
+                    if not tl_confluence:
+                        okay = False
+
+            if okay and (is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last)):
                 if stoch_short_ok and micro_ok("SHORT"):
                     short_candidate = ("TL", tl_val, 3 if confirmed else 2, None, None)
-                    short_note_core = f"S2_TRENDLINE_BOUNCE · {'3x' if confirmed else '2x'} touches (wick-to-wick)"
+                    short_note_core = f"S2_TRENDLINE_BOUNCE · {'3x' if confirmed else '2x'} touches (wick-to-wick) · v2.4"
 
     if short_candidate:
         typ, lvl, touches, dbl, sfp_ok = short_candidate
@@ -970,7 +1125,7 @@ def push_signals(signals):
     if PASS_KEY:
         headers["Authorization"] = f"Bearer {PASS_KEY}"
     payload = {
-        "summary": f"{len(signals)} signal(s) — Bernard System v2.3",
+        "summary": f"{len(signals)} signal(s) — Bernard System v2.4",
         "signals": signals,
     }
     try:
@@ -992,7 +1147,7 @@ def tick_once():
         ex_price = _get_exchange(PRICE_EXCHANGE)
         ex_price.load_markets()
     except Exception as e:
-        return {"engine": "bernard_v2.3", "error": str(e)}
+        return {"engine": "bernard_v2.4", "error": str(e)}
 
     # reset micro cache each tick
     global _MICRO_EX, _MICRO_CACHE
@@ -1034,10 +1189,9 @@ def tick_once():
         push_signals(signals)
 
     return {
-        "engine": "bernard_v2.3",
+        "engine": "bernard_v2.4",
         "scanned": len(WATCHLIST),
         "signals": signals,
         "raw": raw,
         "note": dual_ts(),
     }
-
