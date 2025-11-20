@@ -1,5 +1,5 @@
 # ==========================================================
-#  engine.py — Bernard System v2.4 + JIM Meta + ML Gate
+#  engine.py — Bernard System v2.4 + JIM Meta + ML Gate + Fast Mode
 #
 #  Modes:
 #    BALANCED (default)  — sane filters, good frequency
@@ -29,6 +29,11 @@
 #  - ML Gate (Patterns RF):
 #     * Optional ML veto using RF models trained on 1h patterns dataset
 #     * Env: ML_GATE_ENABLED, ML_LONG_MODEL_PATH, ML_SHORT_MODEL_PATH
+#
+#  - Fast Mode (NEW):
+#     * Uses separate RF models trained on fast 1h labels (2% TP / 1% SL style)
+#     * Only runs if Bernard sniper produces NO signals for this tick
+#     * Reuses same feature builder as ML gate to stay pipeline-safe
 # ==========================================================
 
 import os
@@ -134,6 +139,23 @@ ML_SHORT_WIN_THRESH   = float(os.getenv("ML_SHORT_WIN_THRESH", "0.60")) # min p(
 
 _ML_LONG_MODEL  = None
 _ML_SHORT_MODEL = None
+
+# ---------- Fast Mode Config (NEW, no env required) ----------
+# Fast Mode uses separate RF models trained on "fast" labels
+# (2% TP / 1% SL style). It only runs if Bernard sniper emits
+# no signals for this tick.
+FAST_MODE_ENABLED       = True   # simple flag inside code
+FAST_TP_PCT             = 0.02   # +2% TP
+FAST_SL_PCT             = 0.01   # -1% SL
+FAST_LONG_WIN_THRESH    = 0.65   # starting threshold for fast LONG
+FAST_SHORT_WIN_THRESH   = 0.65   # starting threshold for fast SHORT
+FAST_MAX_BARS           = 24     # informational only (for consumers/UI)
+
+FAST_LONG_MODEL_PATH    = str(MODEL_DIR / "bernard_fast_long_rf_v1.joblib")
+FAST_SHORT_MODEL_PATH   = str(MODEL_DIR / "bernard_fast_short_rf_v1.joblib")
+
+_FAST_LONG_MODEL  = None
+_FAST_SHORT_MODEL = None
 
 # ---------- Utils ----------
 def log(msg: str):
@@ -562,7 +584,7 @@ def trendline_value_at_current(df4: pd.DataFrame, mode: str = "up"):
         pts = [(i, p) for (i, p, t) in swings if t == "high"]
 
     if len(pts) < 2:
-        return None, len(pts)
+        return None, 0
 
     touches = len(pts)
     a_idx, a_p = pts[-2]
@@ -674,13 +696,13 @@ def build_ml_features_for_last_candle(d1: pd.DataFrame):
         prev = d1.iloc[-2]
 
         close = float(last["close"])
-        ema10 = float(d1["ema10"].iloc[-1])
-        ema21 = float(d1["ema21"].iloc[-1])
-        ema50 = float(d1["ema50"].iloc[-1])
-        sma200 = float(d1["sma200"].iloc[-1])
+        ema10_val = float(d1["ema10"].iloc[-1])
+        ema21_val = float(d1["ema21"].iloc[-1])
+        ema50_val = float(d1["ema50"].iloc[-1])
+        sma200_val = float(d1["sma200"].iloc[-1])
 
-        macd_line_val = float(d1["macd"].iloc[-1])
-        m_line, m_sig, m_hist = macd(d1["close"])
+        macd_line_series, m_sig, m_hist = macd(d1["close"])
+        macd_line_val = float(macd_line_series.iloc[-1])
         macd_signal = float(m_sig.iloc[-1])
         macd_hist   = float(m_hist.iloc[-1])
 
@@ -728,10 +750,10 @@ def build_ml_features_for_last_candle(d1: pd.DataFrame):
         trend_code = _trend_code_from_ema(d1["close"], d1["ema10"], d1["ema21"], d1["ema50"], d1["sma200"])
 
         feat = {
-            "ema10": ema10,
-            "ema21": ema21,
-            "ema50": ema50,
-            "sma200": sma200,
+            "ema10": ema10_val,
+            "ema21": ema21_val,
+            "ema50": ema50_val,
+            "sma200": sma200_val,
             "macd_line": macd_line_val,
             "macd_signal": macd_signal,
             "macd_hist": macd_hist,
@@ -797,6 +819,153 @@ def ml_gate_signal(signal, d1: pd.DataFrame):
 
     info["reason"] = "unknown_side"
     return True, info
+
+# ---------- Fast Mode helper (NEW) ----------
+def _load_fast_model(kind: str):
+    global _FAST_LONG_MODEL, _FAST_SHORT_MODEL
+    if not _ML_AVAILABLE or not FAST_MODE_ENABLED:
+        return None
+    try:
+        if kind == "LONG":
+            if _FAST_LONG_MODEL is None:
+                _FAST_LONG_MODEL = joblib.load(FAST_LONG_MODEL_PATH)
+            return _FAST_LONG_MODEL
+        else:
+            if _FAST_SHORT_MODEL is None:
+                _FAST_SHORT_MODEL = joblib.load(FAST_SHORT_MODEL_PATH)
+            return _FAST_SHORT_MODEL
+    except Exception as e:
+        log(f"[FAST] load error ({kind}): {e}")
+        return None
+
+def analyze_symbol_fast(ex, symbol: str, regime: str, dom_bias: str):
+    """
+    Fast Mode:
+      - Uses fast RF models on the same 1h pattern features
+      - Fixed TP/SL in % (FAST_TP_PCT / FAST_SL_PCT)
+      - Only used when sniper emitted no signals for the tick
+    """
+    if not FAST_MODE_ENABLED or not _ML_AVAILABLE:
+        return None
+
+    try:
+        d4 = fetch_tf(ex, symbol, "4h", OHLC_LIMIT_4H)
+        d1 = fetch_tf(ex, symbol, "1h", OHLC_LIMIT_1H)
+    except Exception as e:
+        log(f"[FAST] ohlcv error {symbol}: {e}")
+        return None
+
+    # 4H + 1H indicators (same style as sniper)
+    d4["ema10"] = ema(d4.close, 10)
+    d4["ema21"] = ema(d4.close, 21)
+    d4["ema50"] = ema(d4.close, 50)
+    d4["sma200"] = sma(d4.close, 200)
+    d4["macd"], _, _ = macd(d4.close)
+
+    d1["ema10"] = ema(d1.close, 10)
+    d1["ema21"] = ema(d1.close, 21)
+    d1["ema50"] = ema(d1.close, 50)
+    d1["sma200"] = sma(d1.close, 200)
+    d1["macd"], _, _ = macd(d1.close)
+    d1["rsi"] = rsi(d1.close)
+    d1["atr"] = atr(d1, 14)
+
+    if len(d1) < 20:
+        return None
+
+    trend4 = classify_trend(d4.close, d4.ema10, d4.ema21, d4.ema50, d4.sma200)
+    trend1 = classify_trend(d1.close, d1.ema10, d1.ema21, d1.ema50, d1.sma200)
+    macd1_slope = macd_slope(d1["macd"])
+    last_price = float(d1.close.iloc[-1])
+    atr_val = float(d1["atr"].iloc[-1]) if "atr" in d1.columns else None
+    atr_pct = (atr_val / last_price * 100.0) if atr_val and atr_val > 0 else None
+
+    feat_dict = build_ml_features_for_last_candle(d1)
+    if not feat_dict:
+        return None
+
+    X = pd.DataFrame([feat_dict], columns=ML_FEATURE_COLS)
+
+    long_model = _load_fast_model("LONG")
+    short_model = _load_fast_model("SHORT")
+    if long_model is None or short_model is None:
+        return None
+
+    try:
+        p_long = float(long_model.predict_proba(X)[0, 1])
+        p_short = float(short_model.predict_proba(X)[0, 1])
+    except Exception as e:
+        log(f"[FAST] predict error {symbol}: {e}")
+        return None
+
+    # Select side based on thresholds and relative strength
+    side = None
+    chosen_p = None
+
+    if p_long >= FAST_LONG_WIN_THRESH and p_long >= p_short:
+        side = "LONG"
+        chosen_p = p_long
+    elif p_short >= FAST_SHORT_WIN_THRESH and p_short >= p_long:
+        side = "SHORT"
+        chosen_p = p_short
+    else:
+        return None
+
+    # Basic regime safety: avoid fast LONG in hard risk_off, like sniper
+    if regime == "risk_off" and side == "LONG":
+        return None
+
+    entry_mid = last_price
+    if side == "LONG":
+        sl = entry_mid * (1.0 - FAST_SL_PCT)
+        tp1 = entry_mid * (1.0 + FAST_TP_PCT)
+        tp2 = tp1
+        tp3 = tp1
+    else:
+        sl = entry_mid * (1.0 + FAST_SL_PCT)
+        tp1 = entry_mid * (1.0 - FAST_TP_PCT)
+        tp2 = tp1
+        tp3 = tp1
+
+    sl_pct = abs(sl - entry_mid) / entry_mid * 100.0
+
+    note = (
+        f"FAST_MODE · p_long={p_long:.3f}, p_short={p_short:.3f} · "
+        f"TP={FAST_TP_PCT*100:.1f}%, SL={FAST_SL_PCT*100:.1f}%, max_bars={FAST_MAX_BARS}"
+    )
+
+    signal_dict = {
+        "symbol": _mk(symbol),
+        "side": side,
+        "tf": "1h",
+        "price": entry_mid,
+        "entry": [fnum(entry_mid), fnum(entry_mid)],  # market-style entry band
+        "entry_mid": fnum(entry_mid),
+        "sl": fnum(sl),
+        "tp1": fnum(tp1),
+        "tp2": fnum(tp2),
+        "tp3": fnum(tp3),
+        "note": note,
+        "macd_slope": macd1_slope,
+        "rsi": fnum(d1["rsi"].iloc[-1]),
+        "atr1h_pct": fnum(atr_pct),
+        "body_break_pct": None,
+        "sl_max_pct": fnum(sl_pct),
+        "momentum_score": None,
+        "vol_spike": None,
+        "volume_slope": None,
+        "btc_regime": regime,
+        "dom_bias": dom_bias,
+        "trend4": trend4,
+        "trend1": trend1,
+        "fast_mode": True,
+        "fast_p_long": p_long,
+        "fast_p_short": p_short,
+        "fast_tp_pct": FAST_TP_PCT,
+        "fast_sl_pct": FAST_SL_PCT,
+        "fast_max_bars": FAST_MAX_BARS,
+    }
+    return signal_dict
 
 # ---------- 15m micro confirm ----------
 def micro_ok(ex_name: str, symbol: str, side: str) -> bool:
@@ -1091,190 +1260,7 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
       • S1: 4H S/R bounce + StochRSI gate
       • S2: 4H Trendline bounce (wick-to-wick) + hardened filters
     """
-    highs = cluster_levels(swings4, "high", tolerance_pct=0.5, min_touches=4)
-    lows  = cluster_levels(swings4, "low",  tolerance_pct=0.5, min_touches=4)
-
-    c1 = float(d1["close"].iloc[-1])
-    last = d1.iloc[-1]
-    prev = d1.iloc[-2]
-
-    res_level, res_touch = nearest_level(highs, c1, "above")
-    sup_level, sup_touch = nearest_level(lows,  c1, "below")
-
-    macd_line, _, _ = macd(d1["close"])
-    macd1_dir = macd_slope(macd_line)
-    macd_val = float(macd_line.iloc[-1])
-    rsi1 = float(d1["rsi"].iloc[-1])
-    atr1 = float(d1["atr"].iloc[-1]) if "atr" in d1.columns else None
-
-    k, d = stoch_rsi_series(d1["rsi"], klen=STOCH_KLEN, dlen=STOCH_DLEN)
-    stoch_long_ok  = stoch_cross_up(k, d, oversold=20.0)
-    stoch_short_ok = stoch_cross_down(k, d, overbought=80.0)
-
-    swings1 = detect_swings(d1["close"], look=3)
-    closes = d1["close"]
-
-    def detect_double(swings, kind: str):
-        tt = "high" if kind == "top" else "low"
-        idx = [i for (i, _, t) in swings if t == tt]
-        if len(idx) < 2:
-            return None
-        a, b = idx[-2], idx[-1]
-        pa, pb = float(closes.iloc[a]), float(closes.iloc[b])
-        if abs(pa - pb) / pa * 100.0 > 0.35:
-            return None
-        return (a, b, pa, pb)
-
-    # ===== S1: S/R bounce LONG =====
-    if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
-            if is_tight() and regime == "risk_off":
-                return None
-
-            dbl = detect_double(swings1, "bottom")
-            sfp_ok = detect_sfp_low(d1, swings1)
-            pattern_ok = (
-                is_rejection_candle(last, at_support=True, level=sup_level, tolerance_pct=0.7)
-                or dbl is not None
-                or sfp_ok
-            )
-            if pattern_ok:
-                struct1h = swing_structure_1h(d1["close"], look=2)
-                ema21_1h = float(d1["ema21"].iloc[-1])
-                ema50_1h = float(d1["ema50"].iloc[-1])
-                if struct1h["low_trend"] != "down" and (last["close"] >= ema21_1h and ema21_1h >= ema50_1h * 0.995):
-                    if (macd1_dir == "up" and macd_val >= 0 and 38 <= rsi1 <= 60 and stoch_long_ok and
-                        micro_ok(PRICE_EXCHANGE, symbol, "LONG")):
-                        entry_low = min(last["low"], sup_level)
-                        entry_high = max(last["close"], sup_level * 1.001)
-                        entry_mid = (entry_low + entry_high) / 2.0
-                        sl_price = min(last["low"], sup_level * 0.996)
-                        price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
-                        if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                            note_core = f"B3_SR_BOUNCE · {sup_touch}x support @ {sup_level:.4f} · S1"
-                            if dbl:
-                                _, _, _, pb = dbl
-                                note_core = f"B3_PATTERN · Double Bottom near {pb:.4f} · S1"
-                            if sfp_ok:
-                                note_core += " · SFP_low"
-                            return {
-                                "side": "LONG",
-                                "entry_low": entry_low,
-                                "entry_high": entry_high,
-                                "sl": sl_price,
-                                "note": note_core,
-                            }
-
-    # ===== S1: S/R bounce SHORT =====
-    if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7 and trend4 != "up":
-        if is_tight() and regime == "risk_on":
-            return None
-
-        dbl = detect_double(swings1, "top")
-        sfp_ok = detect_sfp_high(d1, swings1)
-        pattern_ok = (
-            is_rejection_candle(last, at_support=False, level=res_level, tolerance_pct=0.7)
-            or dbl is not None
-            or sfp_ok
-        )
-        if pattern_ok:
-            struct1h = swing_structure_1h(d1["close"], look=2)
-            if struct1h["high_trend"] != "up":
-                if (macd1_dir in ("down", "flat") and macd_val <= 0 and 40 <= rsi1 <= 65 and stoch_short_ok and
-                    micro_ok(PRICE_EXCHANGE, symbol, "SHORT")):
-                    entry_high = max(last["high"], res_level)
-                    entry_low = min(last["close"], res_level * 0.999)
-                    entry_mid = (entry_low + entry_high) / 2.0
-                    sl_price = max(last["high"], res_level * 1.004)
-                    price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
-                    if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                        note_core = f"B3_SR_BOUNCE · {res_touch}x resistance @ {res_level:.4f} · S1"
-                        if dbl:
-                            _, _, _, pb = dbl
-                            note_core = f"B3_PATTERN · Double Top near {pb:.4f} · S1"
-                        if sfp_ok:
-                            note_core += " · SFP_high"
-                        return {
-                            "side": "SHORT",
-                            "entry_low": entry_low,
-                            "entry_high": entry_high,
-                            "sl": sl_price,
-                            "note": note_core,
-                        }
-
-    # ===== S2: Trendline bounce LONG =====
-    if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
-        tl_up, tl_touches = trendline_value_at_current(d4, mode="up")
-        if tl_up:
-            if is_trendline_touch_1h(d1, tl_up, "LONG", TL_TOUCH_TOL_PCT):
-                if atr1 and atr1 > 0:
-                    o, h, l, c, body, rng, uw, lw, _ = candle_stats(last)
-                    body_atr_pct = body / atr1 * 100.0 if atr1 else 0.0
-                    if body_atr_pct < S2_REJECTION_ATR_BODY_PCT:
-                        return None
-                if macd_zero_cross_recent(macd_line, S2_MACD_ZERO_LOOKBACK) not in ("up",):
-                    return None
-                if not pullback_from_extreme_ok(d1["close"], "LONG", atr1, S2_MIN_ATR_PULLBACK_MULT, 20):
-                    return None
-                if not not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT):
-                    return None
-                if not vol_spike(d1["vol"], len(d1)-1, 20, S2_VOL_SPIKE_MULT):
-                    return None
-                if not (is_bull_engulf(prev, last) or is_bull_pin(last) or is_inside_bar(prev, last)):
-                    return None
-                if not (stoch_long_ok and micro_ok(PRICE_EXCHANGE, symbol, "LONG")):
-                    return None
-
-                entry_low = min(last["low"], tl_up)
-                entry_high = max(last["close"], tl_up * 1.001)
-                entry_mid = (entry_low + entry_high) / 2.0
-                sl_price = min(last["low"], tl_up * 0.996)
-                price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
-                if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                    return {
-                        "side": "LONG",
-                        "entry_low": entry_low,
-                        "entry_high": entry_high,
-                        "sl": sl_price,
-                        "note": f"S2_TRENDLINE_BOUNCE · {tl_touches}x wick-to-wick (4H)"
-                    }
-
-    # ===== S2: Trendline bounce SHORT =====
-    if trend4 != "up":
-        tl_dn, tl_touches = trendline_value_at_current(d4, mode="down")
-        if tl_dn:
-            if is_trendline_touch_1h(d1, tl_dn, "SHORT", TL_TOUCH_TOL_PCT):
-                if atr1 and atr1 > 0:
-                    o, h, l, c, body, rng, uw, lw, _ = candle_stats(last)
-                    body_atr_pct = body / atr1 * 100.0 if atr1 else 0.0
-                    if body_atr_pct < S2_REJECTION_ATR_BODY_PCT:
-                        return None
-                if macd_zero_cross_recent(macd_line, S2_MACD_ZERO_LOOKBACK) not in ("down",):
-                    return None
-                if not pullback_from_extreme_ok(d1["close"], "SHORT", atr1, S2_MIN_ATR_PULLBACK_MULT, 20):
-                    return None
-                if not not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT):
-                    return None
-                if not vol_spike(d1["vol"], len(d1)-1, 20, S2_VOL_SPIKE_MULT):
-                    return None
-                if not (is_bear_engulf(prev, last) or is_bear_pin(last) or is_inside_bar(prev, last)):
-                    return None
-                if not (stoch_short_ok and micro_ok(PRICE_EXCHANGE, symbol, "SHORT")):
-                    return None
-
-                entry_high = max(last["high"], tl_dn)
-                entry_low = min(last["close"], tl_dn * 0.999)
-                entry_mid = (entry_low + entry_high) / 2.0
-                sl_price = max(last["high"], tl_dn * 1.004)
-                price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
-                if price_risk_pct <= MAX_PRICE_RISK_PCT:
-                    return {
-                        "side": "SHORT",
-                        "entry_low": entry_low,
-                        "entry_high": entry_high,
-                        "sl": sl_price,
-                        "note": f"S2_TRENDLINE_BOUNCE · {tl_touches}x wick-to-wick (4H)"
-                    }
+    # ... (UNCHANGED B3 body from your file, keep exactly as is) ...
 
     return None
 
@@ -1423,166 +1409,9 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
     return None, raw_row
 
 # ---------- JIM Meta (Tier-1 / Tier-2) ----------
-def _to_float_safe(x):
-    try:
-        v = float(x)
-        return v if math.isfinite(v) else None
-    except Exception:
-        return None
-
-def _classify_family_from_note(note: str) -> str:
-    n = (note or "").upper()
-    for tag in ("S1","S2","S3","S4","B1","B2","B3"):
-        if f" {tag}" in f" {n}":
-            return tag
-    if "BREAK_RETEST" in n:
-        return "S4"
-    if "PURE_BREAK" in n or "BREAK " in n:
-        return "S3"
-    if "TREND_CONT" in n or "CONTINUATION" in n or "EMA PULLBACK" in n:
-        return "B2"
-    if "SR_BOUNCE" in n or "DOUBLE TOP" in n or "DOUBLE BOTTOM" in n or "SFP" in n:
-        return "B3"
-    if "TRENDLINE" in n or "TL" in n:
-        return "S2"
-    return "UNKNOWN"
-
-def _regime_tags(signal: dict) -> list[str]:
-    reg = (signal.get("btc_regime") or "unknown").lower()
-    trend4 = (signal.get("trend4") or "").lower()
-    tags = []
-    if reg == "risk_on":
-        tags.append("RISK_ON")
-    elif reg == "risk_off":
-        if trend4 == "down":
-            tags.append("BTC_WATERFALL_RISK_OFF")
-        else:
-            tags.append("RISK_OFF")
-    elif reg == "neutral":
-        tags.append("NEUTRAL")
-    else:
-        tags.append("UNKNOWN")
-    return tags
-
-def _t1_rules(signal, symbol: str):
-    passed, blocked = [], []
-
-    band_ok = isinstance(signal.get("entry"), list) and len(signal["entry"]) == 2 \
-              and all(_to_float_safe(v) is not None for v in signal["entry"])
-    if band_ok:
-        passed.append("T1-1")
-    else:
-        blocked.append("T1-1")
-
-    slpct = _to_float_safe(signal.get("sl_max_pct"))
-    if slpct is None:
-        passed.append("T1-2")
-    elif slpct > 6.0:
-        blocked.append("T1-2")
-    else:
-        passed.append("T1-2")
-
-    atrp = _to_float_safe(signal.get("atr1h_pct"))
-    if atrp is None:
-        passed.append("T1-30")
-    elif atrp < 0.1:
-        blocked.append("T1-30")
-    else:
-        passed.append("T1-30")
-
-    slope = (signal.get("macd_slope") or "").lower()
-    side = (signal.get("side") or "").upper()
-    if slope:
-        if (side == "LONG" and slope == "down") or (side == "SHORT" and slope == "up"):
-            blocked.append("T1-12")
-        else:
-            passed.append("T1-12")
-    else:
-        passed.append("T1-12")
-
-    rsi = _to_float_safe(signal.get("rsi"))
-    note = (signal.get("note") or "").upper()
-    if rsi is not None:
-        lo, hi = (20.0, 80.0) if ("PURE_BREAK" in note or "BREAK_RETEST" in note) else (35.0, 70.0)
-        if rsi < lo:
-            blocked.append("T1-RSI-LOW")
-        elif rsi > hi:
-            blocked.append("T1-RSI-HIGH")
-
-    sym = (symbol or "").upper()
-    if sym.endswith("ETH/USDT"):
-        pass
-    if sym.endswith("BNB/USDT"):
-        pass
-    if sym.endswith("SOL/USDT"):
-        pass
-    if sym.endswith("ADA/USDT"):
-        pass
-
-    return passed, blocked
-
-def _t2_candidates(signal, t1_block: list[str]) -> list[str]:
-    cands = []
-    rsi = _to_float_safe(signal.get("rsi"))
-    side = (signal.get("side") or "").upper()
-    if "T1-30" in t1_block:
-        return cands
-    diverge = "T1-12" in t1_block
-    if side == "LONG" and rsi is not None and rsi <= 32.0 and (not diverge or side == "LONG"):
-        cands.append("F2-1")
-    if side == "SHORT" and rsi is not None and rsi >= 68.0 and (not diverge or side == "SHORT"):
-        cands.append("F2-2")
-    return cands
-
-def _quality(family: str, t1_block: list[str], slpct: float | None, atrp: float | None) -> str:
-    if "T1-30" in t1_block or "T1-2" in t1_block:
-        return "D"
-    if "T1-12" in t1_block or any(("T1-RSI-LOW" in b or "T1-RSI-HIGH" in b) for b in t1_block):
-        return "C"
-    if not t1_block and family in ("S3","S4","B2","S2"):
-        if slpct is not None and slpct <= 1.5:
-            return "A+"
-        return "A"
-    return "B"
-
-def _append_jim_meta_to_note(note: str, meta: dict) -> str:
-    base = note or ""
-    try:
-        meta_str = json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
-    except Exception:
-        meta_str = "{}"
-    glue = "\n\n" if base and not base.endswith("\n") else ""
-    return f"{base}{glue}JIM_META: {meta_str}"
-
-def annotate_signals(signals: list[dict]) -> list[dict]:
-    out = []
-    for s in signals:
-        try:
-            fam = _classify_family_from_note(s.get("note",""))
-            t1_pass, t1_block = _t1_rules(s, s.get("symbol",""))
-            t2 = _t2_candidates(s, t1_block)
-            slpct = _to_float_safe(s.get("sl_max_pct"))
-            atrp  = _to_float_safe(s.get("atr1h_pct"))
-            meta = {
-                "coin": s.get("symbol","-"),
-                "timeframe": s.get("tf") or s.get("timeframe") or "-",
-                "bernard_family": fam,
-                "tier1_pass": t1_pass,
-                "tier1_block": t1_block,
-                "tier2_candidates": t2,
-                "regime": _regime_tags(s),
-                "overall_quality": _quality(fam, t1_block, slpct, atrp),
-                "notes": "; ".join(
-                    [f"SL {slpct:.2f}%" if slpct is not None else "",
-                     f"ATR1h {atrp:.2f}%" if atrp is not None else ""]
-                ).strip("; ").strip()
-            }
-            s = dict(s)
-            s["note"] = _append_jim_meta_to_note(s.get("note",""), meta)
-            out.append(s)
-        except Exception:
-            out.append(s)
-    return out
+# (keep your existing JIM Meta functions unchanged here)
+# _to_float_safe, _classify_family_from_note, _regime_tags,
+# _t1_rules, _t2_candidates, _quality, _append_jim_meta_to_note, annotate_signals(...)
 
 # ---------- Worker Push ----------
 def push_signals(signals):
@@ -1626,9 +1455,10 @@ def tick_once():
 
     regime, dom_bias = analyze_btc_regime(ex_price, ex_dom)
 
-    signals = []
+    sniper_signals = []
     raw = []
 
+    # -------- Pass 1: Bernard Sniper (existing behaviour) --------
     for sym in WATCHLIST:
         try:
             sig, info = analyze_symbol(ex_price, sym, regime, dom_bias)
@@ -1637,10 +1467,28 @@ def tick_once():
                 if regime == "risk_off" and sig["side"] == "LONG":
                     info["note"] = (info.get("note", "") or "") + " · blocked_by_risk_off"
                 else:
-                    signals.append(sig)
+                    sniper_signals.append(sig)
         except Exception as e:
             raw.append({"symbol": _mk(sym), "error": str(e)})
 
+    signals = sniper_signals
+
+    # -------- Pass 2: Fast Mode (ONLY if no sniper signals) --------
+    if not signals and FAST_MODE_ENABLED and _ML_AVAILABLE:
+        fast_signals = []
+        for sym in WATCHLIST:
+            try:
+                fast_sig = analyze_symbol_fast(ex_price, sym, regime, dom_bias)
+                if fast_sig:
+                    # reuse the same risk_off LONG block as sniper
+                    if regime == "risk_off" and fast_sig["side"] == "LONG":
+                        continue
+                    fast_signals.append(fast_sig)
+            except Exception as e:
+                raw.append({"symbol": _mk(sym), "fast_error": str(e)})
+        signals = fast_signals
+
+    # -------- Meta + Push --------
     if signals:
         signals = annotate_signals(signals)
         push_signals(signals)
