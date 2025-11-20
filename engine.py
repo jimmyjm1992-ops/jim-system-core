@@ -1,5 +1,5 @@
 # ==========================================================
-#  engine.py — Bernard System v2.4 (Pure Bernard Logic)
+#  engine.py — Bernard System v2.4 + JIM Meta + ML Gate
 #
 #  Modes:
 #    BALANCED (default)  — sane filters, good frequency
@@ -13,7 +13,6 @@
 #       B3/S1/S2: Major S/R Bounce + Pattern + Trendline
 #           • S1: 4H S/R bounce + pattern + StochRSI
 #           • S2: 4H Trendline wick-to-wick bounce + StochRSI (hardened)
-#           • (S5 is execution hint; tagged in note on strong S4)
 #
 #  - BTC regime filter (risk_on / risk_off / neutral)
 #  - Optional dominance bias (BTCDOM + USDTDOM via env)
@@ -21,9 +20,22 @@
 #  - TP = 1R / 2R / 3R
 #  - Safe for Koyeb free plan (4H + 1H; optional 15m micro)
 #  - Fully compatible with Worker & Supabase contracts
+#
+#  - JIM Meta Annotator (Tier-1/Tier-2):
+#     * Emits canonical Tier-1 IDs where possible (T1-1, T1-2, T1-12, T1-30)
+#     * F2 candidates use canonical IDs (F2-1, F2-2)
+#     * Appends JIM_META to `note` (non-destructive)
+#
+#  - ML Gate (Patterns RF):
+#     * Optional ML veto using RF models trained on 1h patterns dataset
+#     * Env: ML_GATE_ENABLED, ML_LONG_MODEL_PATH, ML_SHORT_MODEL_PATH
 # ==========================================================
 
-import os, time, pathlib, math
+import os
+import time
+import pathlib
+import math
+import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -32,6 +44,14 @@ import pandas as pd
 import ccxt
 import httpx
 from dotenv import load_dotenv
+
+# ---------- Optional ML Gate imports ----------
+try:
+    import joblib
+    _ML_AVAILABLE = True
+except Exception:
+    joblib = None
+    _ML_AVAILABLE = False
 
 # ---------- FS ROOT ----------
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -76,6 +96,7 @@ STOCH_DLEN  = int(os.getenv("STOCH_DLEN", "3"))   # smoothing for %D
 
 # --- Mode toggle ---
 BERNARD_MODE = os.getenv("BERNARD_MODE", "BALANCED").upper()  # BALANCED | TIGHT
+
 def is_tight() -> bool:
     return BERNARD_MODE == "TIGHT"
 
@@ -92,12 +113,27 @@ WATCHLIST = [
 ]
 
 # Max allowed price risk (in %) between entry_mid and SL
-# (You can tighten via ENV to 3.0 in TIGHT mode, but we keep the variable here.)
 MAX_PRICE_RISK_PCT = float(os.getenv("MAX_PRICE_RISK_PCT", "5.0"))
 
 # Minimum distance (in ATR multiples) from B2 entry price to nearest 4H S/R
 MIN_B2_SR_ATR_MULT = float(os.getenv("MIN_B2_SR_ATR_MULT", "1.5"))
 
+# ---------- ML Gate ENV ----------
+ML_GATE_ENABLED       = int(os.getenv("ML_GATE_ENABLED", "0"))  # 1 = ML veto on, 0 = pure Bernard
+MODEL_DIR             = ROOT / "models"
+ML_LONG_MODEL_PATH    = os.getenv(
+    "ML_LONG_MODEL_PATH",
+    str(MODEL_DIR / "bernard_long_patterns_rf_fix.joblib"),
+)
+ML_SHORT_MODEL_PATH   = os.getenv(
+    "ML_SHORT_MODEL_PATH",
+    str(MODEL_DIR / "bernard_short_patterns_rf_fix.joblib"),
+)
+ML_LONG_WIN_THRESH    = float(os.getenv("ML_LONG_WIN_THRESH", "0.60"))  # min p(win) LONG
+ML_SHORT_WIN_THRESH   = float(os.getenv("ML_SHORT_WIN_THRESH", "0.60")) # min p(win) SHORT
+
+_ML_LONG_MODEL  = None
+_ML_SHORT_MODEL = None
 
 # ---------- Utils ----------
 def log(msg: str):
@@ -137,7 +173,6 @@ def _get_exchange(name: str):
     cls = getattr(ccxt, name)
     return cls({"enableRateLimit": True})
 
-
 # ---------- OHLC helpers ----------
 def timed_fetch_ohlcv(ex, symbol: str, timeframe: str = "1h", limit: int = 400):
     t0 = time.time()
@@ -158,8 +193,7 @@ def _ohlcv(kl):
 def fetch_tf(ex, sym: str, tf: str = "1h", limit: int = 400):
     return _ohlcv(timed_fetch_ohlcv(ex, _mk(sym), tf, limit))
 
-
-# ---------- Indicators (Bernard-style) ----------
+# ---------- Indicators ----------
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
 
@@ -204,10 +238,8 @@ def macd_slope(series: pd.Series) -> str:
         return "down"
     return "flat"
 
-
-# ---------- StochRSI (on RSI series) ----------
+# ---------- StochRSI ----------
 def stoch_rsi_series(rsi_series: pd.Series, klen: int = 14, dlen: int = 3):
-    """Compute StochRSI %K/%D from an RSI series."""
     if len(rsi_series) < max(klen, dlen) + 5:
         k = pd.Series([50.0] * len(rsi_series), index=rsi_series.index)
         d = k.copy()
@@ -217,29 +249,23 @@ def stoch_rsi_series(rsi_series: pd.Series, klen: int = 14, dlen: int = 3):
     denom = (high_k - low_k).replace(0, np.nan)
     k = ((rsi_series - low_k) / denom) * 100.0
     k = k.fillna(50.0)
-    d = k.rolling(dlen).mean().fillna(method="bfill").fillna(50.0)
+    d = k.rolling(dlen).mean().bfill().fillna(50.0)
     return k, d
 
 
 def stoch_cross_up(k: pd.Series, d: pd.Series, oversold: float = 20.0) -> bool:
-    """%K crosses up through %D from oversold on the last candle."""
     if len(k) < 2 or len(d) < 2:
         return False
     return (k.iloc[-2] < d.iloc[-2] and k.iloc[-2] < oversold) and (k.iloc[-1] > d.iloc[-1])
 
 
 def stoch_cross_down(k: pd.Series, d: pd.Series, overbought: float = 80.0) -> bool:
-    """%K crosses down through %D from overbought on the last candle."""
     if len(k) < 2 or len(d) < 2:
         return False
     return (k.iloc[-2] > d.iloc[-2] and k.iloc[-2] > overbought) and (k.iloc[-1] < d.iloc[-1])
 
-
 # ---------- Swings & S/R ----------
 def detect_swings(series: pd.Series, look: int = 3):
-    """
-    Return list of (idx, price, type) where type in {'high','low'}.
-    """
     swings = []
     vals = series.values
     for i in range(look, len(series) - look):
@@ -253,11 +279,6 @@ def detect_swings(series: pd.Series, look: int = 3):
 
 
 def swing_structure_1h(close: pd.Series, look: int = 2):
-    """
-    Read 1H swing structure for B2:
-    - looks at last 2 swing highs and last 2 swing lows
-    - returns 'up' / 'down' / 'flat' for highs and lows
-    """
     swings = detect_swings(close, look=look)
     high_idx = [i for (i, p, t) in swings if t == "high"]
     low_idx  = [i for (i, p, t) in swings if t == "low"]
@@ -273,25 +294,15 @@ def swing_structure_1h(close: pd.Series, look: int = 2):
             return "down"
         return "flat"
 
-    return {
-        "high_trend": trend_from_idx(high_idx),
-        "low_trend": trend_from_idx(low_idx),
-    }
+    return {"high_trend": trend_from_idx(high_idx), "low_trend": trend_from_idx(low_idx)}
 
 
 def cluster_levels(swings, level_type: str, tolerance_pct: float = 0.4, min_touches: int = 4):
-    """
-    Cluster swing highs/lows into S/R levels.
-    tolerance_pct: max distance within cluster (% of price).
-    Returns list of (price, touches).
-    """
     vals = [p for (_, p, t) in swings if t == level_type]
     if not vals:
         return []
-
     vals = sorted(vals)
-    clusters = [[vals[0], 1]]  # [avg, count]
-
+    clusters = [[vals[0], 1]]
     for v in vals[1:]:
         avg, cnt = clusters[-1]
         if abs(v - avg) / avg * 100 <= tolerance_pct:
@@ -299,16 +310,10 @@ def cluster_levels(swings, level_type: str, tolerance_pct: float = 0.4, min_touc
             clusters[-1] = [new_avg, cnt + 1]
         else:
             clusters.append([v, 1])
-
-    out = [(avg, cnt) for (avg, cnt) in clusters if cnt >= min_touches]
-    return out
+    return [(avg, cnt) for (avg, cnt) in clusters if cnt >= min_touches]
 
 
 def nearest_level(levels, price: float, direction: str):
-    """
-    direction: 'above' for resistance, 'below' for support.
-    levels: list of (price, touches)
-    """
     if not levels:
         return None, 0
     if direction == "above":
@@ -324,45 +329,25 @@ def nearest_level(levels, price: float, direction: str):
         lv, n = max(candidates, key=lambda x: x[0])
         return lv, n
 
-
 # ---------- Trend classification ----------
 def classify_trend(close: pd.Series, e10: pd.Series, e21: pd.Series, e50: pd.Series, s200: pd.Series):
-    """
-    Bernard EMA stack trend:
-    - up: close > 10 > 21 > 50 > 200
-    - down: close < 10 < 21 < 50 < 200
-    Else: chop
-    """
     if len(close) < 200:
         return "chop"
-
     c = close.iloc[-1]
     v10 = e10.iloc[-1]
     v21 = e21.iloc[-1]
     v50 = e50.iloc[-1]
     v200 = s200.iloc[-1]
-
     if c > v10 > v21 > v50 > v200:
         return "up"
     if c < v10 < v21 < v50 < v200:
         return "down"
     return "chop"
 
-
 # ---------- BTC Regime + Dominance ----------
 def analyze_btc_regime(ex_price, ex_dom=None):
-    """
-    BTC regime filter:
-      - risk_on: BTC uptrend, MACD up, RSI>50
-      - risk_off: BTC downtrend, MACD down, RSI<50
-      - neutral: everything else
-
-    Dominance (optional):
-      - if env dominance symbols configured, derive a simple bias.
-    """
     regime = "neutral"
     dom_bias = "neutral"
-
     try:
         df4 = fetch_tf(ex_price, "BTCUSDT", "4h", OHLC_LIMIT_4H)
         df1 = fetch_tf(ex_price, "BTCUSDT", "1h", OHLC_LIMIT_1H)
@@ -395,7 +380,6 @@ def analyze_btc_regime(ex_price, ex_dom=None):
         log(f"[BTC_REGIME] error: {e}")
         regime = "neutral"
 
-    # optional dominance
     if ex_dom is not None and DOM_BTCDOM_SYMBOL and DOM_USDTDOM_SYMBOL:
         try:
             btcd = fetch_tf(ex_dom, DOM_BTCDOM_SYMBOL, "4h", OHLC_LIMIT_4H)
@@ -417,7 +401,6 @@ def analyze_btc_regime(ex_price, ex_dom=None):
             dom_bias = "neutral"
 
     return regime, dom_bias
-
 
 # ---------- Candlestick helpers ----------
 def candle_stats(row):
@@ -462,12 +445,6 @@ def is_inside_bar(prev, row):
 
 
 def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr_pct: float, atr_val: float):
-    """
-    Strong breakout candle:
-    - body size >= min_body_atr_pct of ATR
-    - close clearly beyond level
-    - wick not fighting breakout direction too much
-    """
     o, h, l, c, body, rng, uw, lw, _ = candle_stats(row)
     if atr_val is None or atr_val <= 0:
         return False
@@ -476,14 +453,10 @@ def is_strong_break_candle(prev, row, level: float, direction: str, min_body_atr
         return False
 
     if direction == "up":
-        if c <= level:
-            return False
-        if uw / rng > 0.5:
+        if c <= level or (uw / rng > 0.5):
             return False
     else:
-        if c >= level:
-            return False
-        if lw / rng > 0.5:
+        if c >= level or (lw / rng > 0.5):
             return False
     return True
 
@@ -530,8 +503,7 @@ def is_rejection_candle(row, at_support: bool, level: float, tolerance_pct: floa
 
     return False
 
-
-# ---------- Simple SFP / liquidity sweep helpers ----------
+# ---------- Simple SFP ----------
 def detect_sfp_high(d1: pd.DataFrame, swings, lookback: int = 20):
     if len(d1) < 5 or not swings:
         return False
@@ -561,7 +533,6 @@ def detect_sfp_low(d1: pd.DataFrame, swings, lookback: int = 20):
     prev_low = float(d1["low"].iloc[prev_idx])
     return l < prev_low * 0.9995 and c > prev_low
 
-
 # ---------- Volume helper ----------
 def vol_spike(vol_series: pd.Series, idx: int, window: int = 20, mult: float = 1.10) -> bool:
     if idx is None:
@@ -574,18 +545,8 @@ def vol_spike(vol_series: pd.Series, idx: int, window: int = 20, mult: float = 1
         return False
     return v >= base * mult
 
-
 # ---------- Trendline helpers ----------
 def trendline_value_at_current(df4: pd.DataFrame, mode: str = "up"):
-    """
-    Simple TL projection (swing-to-swing):
-      - If TL_USE_WICKS==1:
-          • 'up'  uses 4H lows (wick-to-wick across swing lows)
-          • 'down' uses 4H highs (wick-to-wick across swing highs)
-      - Else:
-          • uses 4H closes (close-to-close swing points)
-    Returns (projected_price, touches) or (None, 0).
-    """
     if TL_USE_WICKS:
         src = df4["low"] if mode == "up" else df4["high"]
     else:
@@ -610,13 +571,12 @@ def trendline_value_at_current(df4: pd.DataFrame, mode: str = "up"):
         return None, touches
 
     slope = (b_p - a_p) / (b_idx - a_idx)
-    proj_idx = len(df4)  # one bar ahead of last
+    proj_idx = len(df4)
     tl_price = b_p + slope * (proj_idx - b_idx)
     return float(tl_price), touches
 
 
 def is_trendline_touch_1h(d1: pd.DataFrame, tl_price: float, side: str, tol_pct: float) -> bool:
-    """Check last 1H candle touches projected TL within tolerance."""
     if tl_price is None or len(d1) < 1:
         return False
     last = d1.iloc[-1]
@@ -627,11 +587,6 @@ def is_trendline_touch_1h(d1: pd.DataFrame, tl_price: float, side: str, tol_pct:
 
 
 def macd_zero_cross_recent(macd_line: pd.Series, lookback: int) -> str:
-    """
-    Return 'up' if crossed from <0 to >0 within lookback,
-           'down' if crossed from >0 to <0 within lookback,
-           'none' otherwise.
-    """
     if len(macd_line) < lookback + 2:
         return "none"
     recent = macd_line.iloc[-(lookback+1):]
@@ -646,11 +601,6 @@ def macd_zero_cross_recent(macd_line: pd.Series, lookback: int) -> str:
 
 
 def not_midrange(close: pd.Series, side: str, lookback: int = 20, midband_pct: float = 30.0) -> bool:
-    """
-    Reject if price sits in the middle band of recent range (sideways grind).
-    For SHORT: reject if price is in lower mid-band (near lows) -> True means OK if NOT near lows.
-    For LONG: reject if near highs.
-    """
     if len(close) < lookback + 2:
         return True
     window = close.iloc[-lookback:]
@@ -669,7 +619,6 @@ def not_midrange(close: pd.Series, side: str, lookback: int = 20, midband_pct: f
 
 
 def pullback_from_extreme_ok(close: pd.Series, side: str, atr_val: float, mult: float = 1.0, lookback: int = 20) -> bool:
-    """Price must have pulled back at least mult*ATR from recent extreme before TL touch."""
     if atr_val is None or atr_val <= 0 or len(close) < lookback + 2:
         return True
     recent = close.iloc[-lookback:]
@@ -681,10 +630,176 @@ def pullback_from_extreme_ok(close: pd.Series, side: str, atr_val: float, mult: 
         recent_high = float(recent.max())
         return (recent_high - last) >= mult * atr_val
 
+# ---------- ML Feature Builder & Gate ----------
+ML_FEATURE_COLS = [
+    "ema10","ema21","ema50","sma200",
+    "macd_line","macd_signal","macd_hist",
+    "rsi14","atr14",
+    "bull_engulf","bear_engulf","bull_pin","bear_pin","inside_bar",
+    "swing_high_3","swing_low_3",
+    "last_swing_high_R","last_swing_low_R",
+    "trend_ema",
+]
 
-# ---------- Timeframe micro confirm (15m) ----------
+def _load_ml_model(kind: str):
+    global _ML_LONG_MODEL, _ML_SHORT_MODEL
+    if not _ML_AVAILABLE or not ML_GATE_ENABLED:
+        return None
+    try:
+        if kind == "LONG":
+            if _ML_LONG_MODEL is None:
+                _ML_LONG_MODEL = joblib.load(ML_LONG_MODEL_PATH)
+            return _ML_LONG_MODEL
+        else:
+            if _ML_SHORT_MODEL is None:
+                _ML_SHORT_MODEL = joblib.load(ML_SHORT_MODEL_PATH)
+            return _ML_SHORT_MODEL
+    except Exception as e:
+        log(f"[ML] load error ({kind}): {e}")
+        return None
+
+def _trend_code_from_ema(close: pd.Series, e10: pd.Series, e21: pd.Series, e50: pd.Series, s200: pd.Series) -> int:
+    t = classify_trend(close, e10, e21, e50, s200)
+    if t == "up":
+        return 1
+    if t == "down":
+        return -1
+    return 0
+
+def build_ml_features_for_last_candle(d1: pd.DataFrame):
+    if len(d1) < 20:
+        return None
+    try:
+        last = d1.iloc[-1]
+        prev = d1.iloc[-2]
+
+        close = float(last["close"])
+        ema10 = float(d1["ema10"].iloc[-1])
+        ema21 = float(d1["ema21"].iloc[-1])
+        ema50 = float(d1["ema50"].iloc[-1])
+        sma200 = float(d1["sma200"].iloc[-1])
+
+        macd_line_val = float(d1["macd"].iloc[-1])
+        m_line, m_sig, m_hist = macd(d1["close"])
+        macd_signal = float(m_sig.iloc[-1])
+        macd_hist   = float(m_hist.iloc[-1])
+
+        rsi14 = float(d1["rsi"].iloc[-1])
+        atr14 = float(d1["atr"].iloc[-1])
+        if not math.isfinite(atr14) or atr14 <= 0:
+            return None
+
+        bull_eng = 1 if is_bull_engulf(prev, last) else 0
+        bear_eng = 1 if is_bear_engulf(prev, last) else 0
+        bull_pin_f = 1 if is_bull_pin(last) else 0
+        bear_pin_f = 1 if is_bear_pin(last) else 0
+        inside_b  = 1 if is_inside_bar(prev, last) else 0
+
+        swings3 = detect_swings(d1["close"], look=3)
+        swing_high_flag = 0
+        swing_low_flag  = 0
+        last_idx = len(d1) - 1
+        last_swing_high_price = None
+        last_swing_low_price  = None
+
+        for i, p, t in swings3:
+            if i == last_idx and t == "high":
+                swing_high_flag = 1
+            if i == last_idx and t == "low":
+                swing_low_flag = 1
+
+        high_idxs = [(i, p) for (i, p, t) in swings3 if t == "high" and i < last_idx]
+        low_idxs  = [(i, p) for (i, p, t) in swings3 if t == "low"  and i < last_idx]
+        if high_idxs:
+            last_swing_high_price = float(high_idxs[-1][1])
+        if low_idxs:
+            last_swing_low_price = float(low_idxs[-1][1])
+
+        if last_swing_high_price is not None:
+            last_swing_high_R = (last_swing_high_price - close) / atr14
+        else:
+            last_swing_high_R = 0.0
+
+        if last_swing_low_price is not None:
+            last_swing_low_R = (close - last_swing_low_price) / atr14
+        else:
+            last_swing_low_R = 0.0
+
+        trend_code = _trend_code_from_ema(d1["close"], d1["ema10"], d1["ema21"], d1["ema50"], d1["sma200"])
+
+        feat = {
+            "ema10": ema10,
+            "ema21": ema21,
+            "ema50": ema50,
+            "sma200": sma200,
+            "macd_line": macd_line_val,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "rsi14": rsi14,
+            "atr14": atr14,
+            "bull_engulf": bull_eng,
+            "bear_engulf": bear_eng,
+            "bull_pin": bull_pin_f,
+            "bear_pin": bear_pin_f,
+            "inside_bar": inside_b,
+            "swing_high_3": swing_high_flag,
+            "swing_low_3": swing_low_flag,
+            "last_swing_high_R": last_swing_high_R,
+            "last_swing_low_R": last_swing_low_R,
+            "trend_ema": trend_code,
+        }
+        return feat
+    except Exception as e:
+        log(f"[ML] build_ml_features_for_last_candle error: {e}")
+        return None
+
+def ml_gate_signal(signal, d1: pd.DataFrame):
+    if not ML_GATE_ENABLED or not _ML_AVAILABLE:
+        return True, {"reason": "ml_disabled"}
+
+    side = (signal.get("side") or "").upper()
+    if side not in ("LONG", "SHORT"):
+        return True, {"reason": "no_side"}
+
+    feat_dict = build_ml_features_for_last_candle(d1)
+    if not feat_dict:
+        return True, {"reason": "no_features"}
+
+    X = pd.DataFrame([feat_dict], columns=ML_FEATURE_COLS)
+
+    long_model  = _load_ml_model("LONG")
+    short_model = _load_ml_model("SHORT")
+    if long_model is None or short_model is None:
+        return True, {"reason": "model_load_failed"}
+
+    try:
+        p_long  = float(long_model.predict_proba(X)[0, 1])
+        p_short = float(short_model.predict_proba(X)[0, 1])
+    except Exception as e:
+        log(f"[ML] predict error: {e}")
+        return True, {"reason": "predict_error"}
+
+    info = {"p_long": p_long, "p_short": p_short}
+
+    if side == "LONG":
+        if (p_long < ML_LONG_WIN_THRESH) or (p_short > p_long):
+            info["reason"] = "veto_long"
+            return False, info
+        info["reason"] = "ok_long"
+        return True, info
+
+    if side == "SHORT":
+        if (p_short < ML_SHORT_WIN_THRESH) or (p_long > p_short):
+            info["reason"] = "veto_short"
+            return False, info
+        info["reason"] = "ok_short"
+        return True, info
+
+    info["reason"] = "unknown_side"
+    return True, info
+
+# ---------- 15m micro confirm ----------
 def micro_ok(ex_name: str, symbol: str, side: str) -> bool:
-    """Optional 15m micro confirmation: a tiny engulf/pin in the right direction."""
     if not USE_15M_MICRO:
         return True
     try:
@@ -702,7 +817,6 @@ def micro_ok(ex_name: str, symbol: str, side: str) -> bool:
     except Exception as e:
         log(f"[15m] micro_ok error: {e}")
         return True
-
 
 # ---------- B1: Breakout + Retest (+ S3 pure break) ----------
 def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
@@ -731,9 +845,9 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         if atr_pct is not None and atr_pct < 0.5:
             return None
 
-    # ----- S3 PURE BREAK (no retest; require volume spike) -----
+    # ----- S3 PURE BREAK -----
     if atr_val and len(d1) >= 3:
-        # LONG break above resistance (TIGHT: regime must be risk_on)
+        # LONG break above resistance
         if ((regime == "risk_on") if is_tight() else (regime != "risk_off")) \
            and trend4 == "up" and dom_bias != "btc_pump_usdt_dump" and res_level:
             if is_tight() and not not_midrange(d1["close"], "LONG", 20, S2_MIDRANGE_REJECT_PCT):
@@ -755,7 +869,7 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                             "note": f"S3_PURE_BREAK · {res_touch}x resistance @ {res_level:.4f}"
                         }
 
-        # SHORT break below support (TIGHT: regime must be risk_off)
+        # SHORT break below support
         if ((regime == "risk_off") if is_tight() else True) and trend4 == "down" and sup_level:
             if is_tight() and not not_midrange(d1["close"], "SHORT", 20, S2_MIDRANGE_REJECT_PCT):
                 return None
@@ -798,7 +912,6 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 price_risk_pct = abs(entry_mid - sl_price) / entry_mid * 100
                 if price_risk_pct <= MAX_PRICE_RISK_PCT:
                     note = f"B1_BREAK_RETEST · {res_touch}x resistance @ {res_level:.4f} · S4"
-                    # S5 hint: strong break candle had volume spike → consider 50/50 execution
                     try:
                         if vol_spike(d1["vol"], len(d1)-2, 20, 1.15):
                             note += " · S5_SPLIT_50_50"
@@ -827,7 +940,6 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                 price_risk_pct = abs(sl_price - entry_mid) / entry_mid * 100
                 if price_risk_pct <= MAX_PRICE_RISK_PCT:
                     note = f"B1_BREAK_RETEST · {sup_touch}x support @ {sup_level:.4f} · S4"
-                    # S5 hint: strong break candle had volume spike → consider 50/50 execution
                     try:
                         if vol_spike(d1["vol"], len(d1)-2, 20, 1.15):
                             note += " · S5_SPLIT_50_50"
@@ -837,12 +949,10 @@ def b1_break_retest(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 
     return None
 
-
 # ---------- B2: Trend Continuation (EMA pullback / mini-flag) ----------
 def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
-    B2 v2.4: Trend continuation using EMA pullback / mini-flag with extra guardrails
-    to avoid weak/sideways pokes.
+    B2 v2.4: Trend continuation using EMA pullback / mini-flag with extra guardrails.
     """
     if trend4 not in ("up", "down"):
         return None
@@ -858,7 +968,6 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     if not atr1 or atr1 <= 0:
         return None
 
-    # Mini-flag consolidation (last 4)
     recent = d1.iloc[-5:-1]
     if len(recent) < 4:
         return None
@@ -903,7 +1012,6 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
         dist = res_level - price
         return dist >= MIN_B2_SR_ATR_MULT * atr1
 
-    # Optional volume behaviour
     vol = d1["vol"]
     if len(vol) >= 22:
         flag_vol_avg = float(vol.iloc[-5:-1].mean())
@@ -915,7 +1023,7 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
             if trigger_vol < flag_vol_avg * 0.7:
                 return None
 
-    # ----- LONG continuation -----
+    # LONG continuation
     if trend4 == "up" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump" \
        and (trend1_local == "up" if is_tight() else True):
 
@@ -945,7 +1053,7 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                     "note": "B2_TREND_CONT · EMA pullback in 4H uptrend (mini-flag, v2.4)"
                 }
 
-    # ----- SHORT continuation -----
+    # SHORT continuation
     if trend4 == "down" and (trend1_local == "down" if is_tight() else True):
         in_ema_zone = (ema21_1h * 1.005 >= c >= ema10_1h * 0.995) and (c < ema50_1h)
         macd_ok = (macd_val < 0) and (macd1_dir == "down")
@@ -975,12 +1083,11 @@ def b2_trend_continuation(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 
     return None
 
-
 # ---------- B3: Major S/R Bounce + Pattern (+ S1 + S2) ----------
 def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
     """
     B3: Major S/R bounce + pattern (double top/bottom + SFP-style).
-    Also hosts:
+    Hosts:
       • S1: 4H S/R bounce + StochRSI gate
       • S2: 4H Trendline bounce (wick-to-wick) + hardened filters
     """
@@ -1018,10 +1125,9 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
             return None
         return (a, b, pa, pb)
 
-    # ==================== S1: S/R bounce (LONG) ====================
+    # ===== S1: S/R bounce LONG =====
     if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         if sup_level and abs(last["low"] - sup_level) / sup_level * 100 <= 0.7:
-            # Tight-mode: avoid bottom-catch in risk_off regime
             if is_tight() and regime == "risk_off":
                 return None
 
@@ -1059,9 +1165,8 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                                 "note": note_core,
                             }
 
-    # ==================== S1: S/R bounce (SHORT) ====================
+    # ===== S1: S/R bounce SHORT =====
     if res_level and abs(last["high"] - res_level) / res_level * 100 <= 0.7 and trend4 != "up":
-        # Tight-mode: avoid top-fade in risk_on regime
         if is_tight() and regime == "risk_on":
             return None
 
@@ -1097,8 +1202,7 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                             "note": note_core,
                         }
 
-    # ==================== S2: Trendline bounce (hardened) ====================
-    # LONG S2
+    # ===== S2: Trendline bounce LONG =====
     if trend4 != "down" and regime != "risk_off" and dom_bias != "btc_pump_usdt_dump":
         tl_up, tl_touches = trendline_value_at_current(d4, mode="up")
         if tl_up:
@@ -1135,7 +1239,7 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
                         "note": f"S2_TRENDLINE_BOUNCE · {tl_touches}x wick-to-wick (4H)"
                     }
 
-    # SHORT S2
+    # ===== S2: Trendline bounce SHORT =====
     if trend4 != "up":
         tl_dn, tl_touches = trendline_value_at_current(d4, mode="down")
         if tl_dn:
@@ -1174,11 +1278,10 @@ def b3_sr_bounce_and_pattern(symbol, d4, d1, swings4, trend4, regime, dom_bias):
 
     return None
 
-
 # ---------- Symbol Analysis ----------
 def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
     """
-    Full Bernard-style analysis for one symbol.
+    Full Bernard-style analysis for one symbol + ML gate.
     Returns (signal_dict or None, raw_row dict)
     """
     d4 = fetch_tf(ex, symbol, "4h", OHLC_LIMIT_4H)
@@ -1242,7 +1345,6 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
             signal = sig_b3
             raw_row["note"] = sig_b3["note"]
 
-    # Convert to signal dict for Worker (with R-based TP)
     if signal:
         side = signal["side"]
         entry_low = float(signal["entry_low"])
@@ -1250,7 +1352,6 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
         entry_mid = (entry_low + entry_high) / 2.0
         sl = float(signal["sl"])
 
-        # Risk in price terms
         if side == "LONG":
             risk = entry_mid - sl
         else:
@@ -1259,7 +1360,6 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
         if risk <= 0 or not math.isfinite(risk):
             return None, raw_row
 
-        # TP = 1R / 2R / 3R
         if side == "LONG":
             tp1 = entry_mid + risk
             tp2 = entry_mid + 2 * risk
@@ -1285,7 +1385,6 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
             "tp2": fnum(tp2),
             "tp3": fnum(tp3),
             "note": signal["note"],
-            # telemetry for Supabase (can be null)
             "macd_slope": macd1_slope,
             "rsi": fnum(d1["rsi"].iloc[-1]),
             "atr1h_pct": fnum(atr_pct),
@@ -1294,7 +1393,23 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
             "momentum_score": None,
             "vol_spike": None,
             "volume_slope": None,
+            "btc_regime": regime,
+            "dom_bias": dom_bias,
+            "trend4": trend4,
+            "trend1": trend1,
         }
+
+        # ---------- ML gate ----------
+        allowed, ml_info = ml_gate_signal(signal_dict, d1)
+        if not allowed:
+            note_old = raw_row.get("note", "") or ""
+            raw_row["note"] = (note_old + " · ml_veto").strip()
+            raw_row["ml_p_long"] = ml_info.get("p_long")
+            raw_row["ml_p_short"] = ml_info.get("p_short")
+            return None, raw_row
+        else:
+            signal_dict["ml_p_long"] = ml_info.get("p_long")
+            signal_dict["ml_p_short"] = ml_info.get("p_short")
 
         raw_row["side"] = side
         raw_row["signal"] = "TRIGGER"
@@ -1307,6 +1422,167 @@ def analyze_symbol(ex, symbol: str, regime: str, dom_bias: str):
 
     return None, raw_row
 
+# ---------- JIM Meta (Tier-1 / Tier-2) ----------
+def _to_float_safe(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+def _classify_family_from_note(note: str) -> str:
+    n = (note or "").upper()
+    for tag in ("S1","S2","S3","S4","B1","B2","B3"):
+        if f" {tag}" in f" {n}":
+            return tag
+    if "BREAK_RETEST" in n:
+        return "S4"
+    if "PURE_BREAK" in n or "BREAK " in n:
+        return "S3"
+    if "TREND_CONT" in n or "CONTINUATION" in n or "EMA PULLBACK" in n:
+        return "B2"
+    if "SR_BOUNCE" in n or "DOUBLE TOP" in n or "DOUBLE BOTTOM" in n or "SFP" in n:
+        return "B3"
+    if "TRENDLINE" in n or "TL" in n:
+        return "S2"
+    return "UNKNOWN"
+
+def _regime_tags(signal: dict) -> list[str]:
+    reg = (signal.get("btc_regime") or "unknown").lower()
+    trend4 = (signal.get("trend4") or "").lower()
+    tags = []
+    if reg == "risk_on":
+        tags.append("RISK_ON")
+    elif reg == "risk_off":
+        if trend4 == "down":
+            tags.append("BTC_WATERFALL_RISK_OFF")
+        else:
+            tags.append("RISK_OFF")
+    elif reg == "neutral":
+        tags.append("NEUTRAL")
+    else:
+        tags.append("UNKNOWN")
+    return tags
+
+def _t1_rules(signal, symbol: str):
+    passed, blocked = [], []
+
+    band_ok = isinstance(signal.get("entry"), list) and len(signal["entry"]) == 2 \
+              and all(_to_float_safe(v) is not None for v in signal["entry"])
+    if band_ok:
+        passed.append("T1-1")
+    else:
+        blocked.append("T1-1")
+
+    slpct = _to_float_safe(signal.get("sl_max_pct"))
+    if slpct is None:
+        passed.append("T1-2")
+    elif slpct > 6.0:
+        blocked.append("T1-2")
+    else:
+        passed.append("T1-2")
+
+    atrp = _to_float_safe(signal.get("atr1h_pct"))
+    if atrp is None:
+        passed.append("T1-30")
+    elif atrp < 0.1:
+        blocked.append("T1-30")
+    else:
+        passed.append("T1-30")
+
+    slope = (signal.get("macd_slope") or "").lower()
+    side = (signal.get("side") or "").upper()
+    if slope:
+        if (side == "LONG" and slope == "down") or (side == "SHORT" and slope == "up"):
+            blocked.append("T1-12")
+        else:
+            passed.append("T1-12")
+    else:
+        passed.append("T1-12")
+
+    rsi = _to_float_safe(signal.get("rsi"))
+    note = (signal.get("note") or "").upper()
+    if rsi is not None:
+        lo, hi = (20.0, 80.0) if ("PURE_BREAK" in note or "BREAK_RETEST" in note) else (35.0, 70.0)
+        if rsi < lo:
+            blocked.append("T1-RSI-LOW")
+        elif rsi > hi:
+            blocked.append("T1-RSI-HIGH")
+
+    sym = (symbol or "").upper()
+    if sym.endswith("ETH/USDT"):
+        pass
+    if sym.endswith("BNB/USDT"):
+        pass
+    if sym.endswith("SOL/USDT"):
+        pass
+    if sym.endswith("ADA/USDT"):
+        pass
+
+    return passed, blocked
+
+def _t2_candidates(signal, t1_block: list[str]) -> list[str]:
+    cands = []
+    rsi = _to_float_safe(signal.get("rsi"))
+    side = (signal.get("side") or "").upper()
+    if "T1-30" in t1_block:
+        return cands
+    diverge = "T1-12" in t1_block
+    if side == "LONG" and rsi is not None and rsi <= 32.0 and (not diverge or side == "LONG"):
+        cands.append("F2-1")
+    if side == "SHORT" and rsi is not None and rsi >= 68.0 and (not diverge or side == "SHORT"):
+        cands.append("F2-2")
+    return cands
+
+def _quality(family: str, t1_block: list[str], slpct: float | None, atrp: float | None) -> str:
+    if "T1-30" in t1_block or "T1-2" in t1_block:
+        return "D"
+    if "T1-12" in t1_block or any(("T1-RSI-LOW" in b or "T1-RSI-HIGH" in b) for b in t1_block):
+        return "C"
+    if not t1_block and family in ("S3","S4","B2","S2"):
+        if slpct is not None and slpct <= 1.5:
+            return "A+"
+        return "A"
+    return "B"
+
+def _append_jim_meta_to_note(note: str, meta: dict) -> str:
+    base = note or ""
+    try:
+        meta_str = json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        meta_str = "{}"
+    glue = "\n\n" if base and not base.endswith("\n") else ""
+    return f"{base}{glue}JIM_META: {meta_str}"
+
+def annotate_signals(signals: list[dict]) -> list[dict]:
+    out = []
+    for s in signals:
+        try:
+            fam = _classify_family_from_note(s.get("note",""))
+            t1_pass, t1_block = _t1_rules(s, s.get("symbol",""))
+            t2 = _t2_candidates(s, t1_block)
+            slpct = _to_float_safe(s.get("sl_max_pct"))
+            atrp  = _to_float_safe(s.get("atr1h_pct"))
+            meta = {
+                "coin": s.get("symbol","-"),
+                "timeframe": s.get("tf") or s.get("timeframe") or "-",
+                "bernard_family": fam,
+                "tier1_pass": t1_pass,
+                "tier1_block": t1_block,
+                "tier2_candidates": t2,
+                "regime": _regime_tags(s),
+                "overall_quality": _quality(fam, t1_block, slpct, atrp),
+                "notes": "; ".join(
+                    [f"SL {slpct:.2f}%" if slpct is not None else "",
+                     f"ATR1h {atrp:.2f}%" if atrp is not None else ""]
+                ).strip("; ").strip()
+            }
+            s = dict(s)
+            s["note"] = _append_jim_meta_to_note(s.get("note",""), meta)
+            out.append(s)
+        except Exception:
+            out.append(s)
+    return out
 
 # ---------- Worker Push ----------
 def push_signals(signals):
@@ -1325,13 +1601,11 @@ def push_signals(signals):
     except Exception as e:
         print(f"[PUSH ERROR] {e}")
 
-
 # ---------- Timestamp helper ----------
 def dual_ts():
     utc = datetime.now(timezone.utc)
     kl = utc.astimezone(ZoneInfo("Asia/Kuala_Lumpur"))
     return f"{utc:%Y-%m-%d %H:%M:%S UTC} | {kl:%Y-%m-%d %H:%M:%S KL}"
-
 
 # ---------- Tick Once ----------
 def tick_once():
@@ -1341,7 +1615,6 @@ def tick_once():
     except Exception as e:
         return {"engine": "bernard_v2.4", "error": str(e)}
 
-    # dominance exchange may be same or different
     ex_dom = None
     if DOM_BTCDOM_SYMBOL and DOM_USDTDOM_SYMBOL:
         try:
@@ -1361,7 +1634,6 @@ def tick_once():
             sig, info = analyze_symbol(ex_price, sym, regime, dom_bias)
             raw.append(info)
             if sig:
-                # extra guard: block fresh longs when BTC is clearly risk_off
                 if regime == "risk_off" and sig["side"] == "LONG":
                     info["note"] = (info.get("note", "") or "") + " · blocked_by_risk_off"
                 else:
@@ -1370,6 +1642,7 @@ def tick_once():
             raw.append({"symbol": _mk(sym), "error": str(e)})
 
     if signals:
+        signals = annotate_signals(signals)
         push_signals(signals)
 
     return {
