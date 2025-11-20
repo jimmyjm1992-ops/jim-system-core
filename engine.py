@@ -1437,6 +1437,169 @@ def dual_ts():
     kl = utc.astimezone(ZoneInfo("Asia/Kuala_Lumpur"))
     return f"{utc:%Y-%m-%d %H:%M:%S UTC} | {kl:%Y-%m-%d %H:%M:%S KL}"
 
+# ---------- JIM Meta (Tier-1 / Tier-2) ----------
+def _to_float_safe(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+def _classify_family_from_note(note: str) -> str:
+    n = (note or "").upper()
+    for tag in ("S1","S2","S3","S4","B1","B2","B3"):
+        if f" {tag}" in f" {n}":
+            return tag
+    if "BREAK_RETEST" in n:
+        return "S4"
+    if "PURE_BREAK" in n or "BREAK " in n:
+        return "S3"
+    if "TREND_CONT" in n or "CONTINUATION" in n or "EMA PULLBACK" in n:
+        return "B2"
+    if "SR_BOUNCE" in n or "DOUBLE TOP" in n or "DOUBLE BOTTOM" in n or "SFP" in n:
+        return "B3"
+    if "TRENDLINE" in n or "TL" in n:
+        return "S2"
+    return "UNKNOWN"
+
+def _regime_tags(signal: dict) -> list[str]:
+    reg = (signal.get("btc_regime") or "unknown").lower()
+    trend4 = (signal.get("trend4") or "").lower()
+    tags = []
+    if reg == "risk_on":
+        tags.append("RISK_ON")
+    elif reg == "risk_off":
+        if trend4 == "down":
+            tags.append("BTC_WATERFALL_RISK_OFF")
+        else:
+            tags.append("RISK_OFF")
+    elif reg == "neutral":
+        tags.append("NEUTRAL")
+    else:
+        tags.append("UNKNOWN")
+    return tags
+
+def _t1_rules(signal, symbol: str):
+    passed, blocked = [], []
+
+    band_ok = isinstance(signal.get("entry"), list) and len(signal["entry"]) == 2 \
+              and all(_to_float_safe(v) is not None for v in signal["entry"])
+    if band_ok:
+        passed.append("T1-1")
+    else:
+        blocked.append("T1-1")
+
+    slpct = _to_float_safe(signal.get("sl_max_pct"))
+    if slpct is None:
+        passed.append("T1-2")
+    elif slpct > 6.0:
+        blocked.append("T1-2")
+    else:
+        passed.append("T1-2")
+
+    atrp = _to_float_safe(signal.get("atr1h_pct"))
+    if atrp is None:
+        passed.append("T1-30")
+    elif atrp < 0.1:
+        blocked.append("T1-30")
+    else:
+        passed.append("T1-30")
+
+    slope = (signal.get("macd_slope") or "").lower()
+    side = (signal.get("side") or "").upper()
+    if slope:
+        if (side == "LONG" and slope == "down") or (side == "SHORT" and slope == "up"):
+            blocked.append("T1-12")
+        else:
+            passed.append("T1-12")
+    else:
+        passed.append("T1-12")
+
+    rsi = _to_float_safe(signal.get("rsi"))
+    note = (signal.get("note") or "").upper()
+    if rsi is not None:
+        lo, hi = (20.0, 80.0) if ("PURE_BREAK" in note or "BREAK_RETEST" in note) else (35.0, 70.0)
+        if rsi < lo:
+            blocked.append("T1-RSI-LOW")
+        elif rsi > hi:
+            blocked.append("T1-RSI-HIGH")
+
+    sym = (symbol or "").upper()
+    if sym.endswith("ETH/USDT"):
+        pass
+    if sym.endswith("BNB/USDT"):
+        pass
+    if sym.endswith("SOL/USDT"):
+        pass
+    if sym.endswith("ADA/USDT"):
+        pass
+
+    return passed, blocked
+
+def _t2_candidates(signal, t1_block: list[str]) -> list[str]:
+    cands = []
+    rsi = _to_float_safe(signal.get("rsi"))
+    side = (signal.get("side") or "").upper()
+    if "T1-30" in t1_block:
+        return cands
+    diverge = "T1-12" in t1_block
+    if side == "LONG" and rsi is not None and rsi <= 32.0 and (not diverge or side == "LONG"):
+        cands.append("F2-1")
+    if side == "SHORT" and rsi is not None and rsi >= 68.0 and (not diverge or side == "SHORT"):
+        cands.append("F2-2")
+    return cands
+
+def _quality(family: str, t1_block: list[str], slpct: float | None, atrp: float | None) -> str:
+    if "T1-30" in t1_block or "T1-2" in t1_block:
+        return "D"
+    if "T1-12" in t1_block or any(("T1-RSI-LOW" in b or "T1-RSI-HIGH" in b) for b in t1_block):
+        return "C"
+    if not t1_block and family in ("S3","S4","B2","S2"):
+        if slpct is not None and slpct <= 1.5:
+            return "A+"
+        return "A"
+    return "B"
+
+def _append_jim_meta_to_note(note: str, meta: dict) -> str:
+    base = note or ""
+    try:
+        meta_str = json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        meta_str = "{}"
+    glue = "\n\n" if base and not base.endswith("\n") else ""
+    return f"{base}{glue}JIM_META: {meta_str}"
+
+def annotate_signals(signals: list[dict]) -> list[dict]:
+    out = []
+    for s in signals:
+        try:
+            fam = _classify_family_from_note(s.get("note",""))
+            t1_pass, t1_block = _t1_rules(s, s.get("symbol",""))
+            t2 = _t2_candidates(s, t1_block)
+            slpct = _to_float_safe(s.get("sl_max_pct"))
+            atrp  = _to_float_safe(s.get("atr1h_pct"))
+            meta = {
+                "coin": s.get("symbol","-"),
+                "timeframe": s.get("tf") or s.get("timeframe") or "-",
+                "bernard_family": fam,
+                "tier1_pass": t1_pass,
+                "tier1_block": t1_block,
+                "tier2_candidates": t2,
+                "regime": _regime_tags(s),
+                "overall_quality": _quality(fam, t1_block, slpct, atrp),
+                "notes": "; ".join(
+                    [f"SL {slpct:.2f}%" if slpct is not None else "",
+                     f"ATR1h {atrp:.2f}%" if atrp is not None else ""]
+                ).strip("; ").strip()
+            }
+            s = dict(s)
+            s["note"] = _append_jim_meta_to_note(s.get("note",""), meta)
+            out.append(s)
+        except Exception:
+            out.append(s)
+    return out
+
+
 # ---------- Tick Once ----------
 def tick_once():
     try:
