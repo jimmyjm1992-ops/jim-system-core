@@ -140,19 +140,20 @@ ML_SHORT_WIN_THRESH   = float(os.getenv("ML_SHORT_WIN_THRESH", "0.60")) # min p(
 _ML_LONG_MODEL  = None
 _ML_SHORT_MODEL = None
 
-# ---------- Fast Mode Config (NEW, no env required) ----------
-# Fast Mode uses separate RF models trained on "fast" labels
-# (2% TP / 1% SL style). It only runs if Bernard sniper emits
-# no signals for this tick.
-FAST_MODE_ENABLED       = True   # simple flag inside code
-FAST_TP_PCT             = 0.02   # +2% TP
-FAST_SL_PCT             = 0.01   # -1% SL
-FAST_LONG_WIN_THRESH    = 0.65   # starting threshold for fast LONG
-FAST_SHORT_WIN_THRESH   = 0.65   # starting threshold for fast SHORT
-FAST_MAX_BARS           = 24     # informational only (for consumers/UI)
+# ---------- Fast Mode Config ----------
+FAST_MODE_ENABLED       = True   # keep enabled
+FAST_TP_PCT             = 0.02   # 2% TP
+FAST_SL_PCT             = 0.01   # 1% SL
+
+# Use high-quality thresholds based on eval:
+FAST_LONG_WIN_THRESH    = 0.70
+FAST_SHORT_WIN_THRESH   = 0.70
+
+FAST_MAX_BARS           = 24
 
 FAST_LONG_MODEL_PATH    = str(MODEL_DIR / "bernard_fast_long_rf_v1.joblib")
 FAST_SHORT_MODEL_PATH   = str(MODEL_DIR / "bernard_fast_short_rf_v1.joblib")
+
 
 _FAST_LONG_MODEL  = None
 _FAST_SHORT_MODEL = None
