@@ -141,11 +141,11 @@ _ML_LONG_MODEL  = None
 _ML_SHORT_MODEL = None
 
 # ---------- Fast Mode Config ----------
-FAST_MODE_ENABLED       = True   # keep enabled
-FAST_TP_PCT             = 0.02   # 2% TP
-FAST_SL_PCT             = 0.01   # 1% SL
+FAST_MODE_ENABLED       = int(os.getenv("FAST_MODE_ENABLED", "0"))  # 0 = OFF, 1 = ON
 
-# Use high-quality thresholds based on eval:
+FAST_TP_PCT             = 0.02   # keep values for future experiments
+FAST_SL_PCT             = 0.01
+
 FAST_LONG_WIN_THRESH    = 0.70
 FAST_SHORT_WIN_THRESH   = 0.70
 
@@ -154,9 +154,6 @@ FAST_MAX_BARS           = 24
 FAST_LONG_MODEL_PATH    = str(MODEL_DIR / "bernard_fast_long_rf_v1.joblib")
 FAST_SHORT_MODEL_PATH   = str(MODEL_DIR / "bernard_fast_short_rf_v1.joblib")
 
-
-_FAST_LONG_MODEL  = None
-_FAST_SHORT_MODEL = None
 
 # ---------- Utils ----------
 def log(msg: str):
