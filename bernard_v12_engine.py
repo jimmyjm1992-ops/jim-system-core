@@ -44,7 +44,7 @@ DASHBOARD_JSON_PATH = LIVE_DIR / "v12_dashboard.json"
 # Use V12 meta model (trained on Bernard v12 base)
 META_MODEL_PATH = MODELS_DIR / "bernard_v12_meta_rf.joblib"
 
-# 46-symbol watchlist (matches the symbols seen in your logs)
+# 46-symbol watchlist (matches your V12 set)
 WATCHLIST: List[str] = [
     "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "LINKUSDT",
     "AVAXUSDT", "BNBUSDT", "UNIUSDT", "DOTUSDT", "LTCUSDT",
@@ -74,6 +74,9 @@ SUPABASE_KEY = (
 )
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GPT_MODEL = os.getenv("BERNARD_GPT_MODEL", "gpt-4.1-mini")
+
+# Exchange selection (Binance is blocked on Koyeb, so we can switch via env)
+EXCHANGE_ID = os.getenv("BERNARD_EXCHANGE_ID", "binance")
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -246,11 +249,7 @@ def get_market_context(
     now_utc: datetime,
 ) -> MarketContext:
     """
-    Build Bernard-style macro context:
-    - BTC 4H trend (approximated)
-    - BTC regime (risk_on / risk_off / neutral)
-    - Dominance regime (btc_favored / alt_favored / mixed)
-    - is_high_vol_session (London/NY)
+    Build Bernard-style macro context.
     """
     df = calculate_indicators(btc_df)
     if len(df) < 210:
@@ -749,7 +748,6 @@ class BernardEngineV12:
                 # Attempt to parse JSON; tolerate wrapped code fences
                 if content.startswith("```"):
                     content = content.strip("`")
-                    # handle formats like ```json\n...\n```
                     parts = content.split("\n", 1)
                     if len(parts) == 2:
                         content = parts[1]
@@ -760,7 +758,6 @@ class BernardEngineV12:
                 sig["gpt_comment"] = decision.get("comment")
             except Exception as e:
                 logger.warning(f"[GPT] Failed to enrich signal {symbol}: {e}")
-                # leave gpt_* as None to indicate 'not checked'
                 pass
 
             return sig
@@ -887,8 +884,14 @@ class BernardEngineV12:
     # ------------------ MAIN LOOP ------------------
 
     def run(self):
-        logger.info("[EXCHANGE] Loading Binance markets once...")
-        exchange = ccxt.binance({"enableRateLimit": True})
+        logger.info(f"[EXCHANGE] Initialising CCXT exchange: {EXCHANGE_ID}")
+        try:
+            exchange_class = getattr(ccxt, EXCHANGE_ID)
+        except AttributeError:
+            logger.error(f"[EXCHANGE] Unknown exchange id: {EXCHANGE_ID}")
+            return
+
+        exchange = exchange_class({"enableRateLimit": True})
         try:
             exchange.load_markets()
         except Exception as e:
@@ -980,8 +983,6 @@ class BernardEngineV12:
             # 5. Append to history parquet (fix: ts_kl as string)
             if active:
                 df_new = pd.DataFrame(active)
-
-                # ensure ts_kl is consistent string to avoid ArrowTypeError
                 df_new["ts_kl"] = df_new["ts_kl"].astype(str)
 
                 if LIVE_HISTORY_PATH.exists():
@@ -994,7 +995,7 @@ class BernardEngineV12:
 
                 df_hist.to_parquet(LIVE_HISTORY_PATH, index=False)
 
-            # 6. Write dashboard JSON snapshot (Cloudflare / TradingView reader)
+            # 6. Write dashboard JSON snapshot
             dashboard_data = {
                 "updated_kl": datetime.now(KL_TZ).isoformat(timespec="seconds"),
                 "btc_price": btc_price,
