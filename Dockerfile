@@ -22,4 +22,5 @@ EXPOSE 8000
 # ---------- Start both processes ----------
 # 1) engine_loop.py  -> scanner (background)
 # 2) app.py          -> FastAPI (serves /health, /tick)
-CMD ["bash", "-lc", "python engine_loop.py & uvicorn app:app --host 0.0.0.0 --port 8000"]
+CMD ["bash", "-lc", "python bernard_v12_engine.py & uvicorn app:app --host 0.0.0.0 --port 8000"]
+
