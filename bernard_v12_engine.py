@@ -4,6 +4,8 @@ import pathlib
 import time
 import logging
 import os
+import base64
+import io
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
@@ -13,6 +15,11 @@ import ccxt
 import joblib
 import numpy as np
 import pandas as pd
+
+# matplotlib for chart generation (headless)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Optional Supabase + OpenAI imports
 try:
@@ -75,7 +82,7 @@ SUPABASE_KEY = (
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GPT_MODEL = os.getenv("BERNARD_GPT_MODEL", "gpt-4.1-mini")
 
-# Exchange selection (Binance is blocked on Koyeb, so we can switch via env)
+# Exchange selection (Binance blocked on some clouds, so switch via env)
 EXCHANGE_ID = os.getenv("BERNARD_EXCHANGE_ID", "binance")
 
 logging.basicConfig(
@@ -326,6 +333,60 @@ def load_zones(symbol: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------
+# CHART GENERATION FOR GPT
+# ---------------------------------------------------------------------
+
+def make_signal_chart_png(
+    df: Optional[pd.DataFrame],
+    zone_top: float,
+    zone_btm: float,
+    max_bars: int = 120,
+) -> bytes:
+    """
+    Generate a simple Bernard-style 1H chart around the active zone.
+    Returns PNG bytes. If df is empty, returns b"".
+    """
+    if df is None or df.empty:
+        return b""
+
+    df = df.copy().tail(max_bars)
+    if df.empty:
+        return b""
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    # Plot candles
+    # Use datetime index directly for x-axis
+    for ts, row in df.iterrows():
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+
+        # wick
+        ax.vlines(ts, l, h, linewidth=1)
+        # body
+        if c >= o:
+            ax.vlines(ts, o, c, linewidth=3)
+        else:
+            ax.vlines(ts, c, o, linewidth=3)
+
+    # Zone band
+    ax.axhspan(zone_btm, zone_top, alpha=0.2)
+
+    # Basic title
+    ax.set_ylabel("Price")
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------
 # CORE ENGINE V12
 # ---------------------------------------------------------------------
 
@@ -463,7 +524,6 @@ class BernardEngineV12:
             zone_h = z_top - z_btm
             if zone_h <= 0:
                 continue
-            mid = (z_top + z_btm) / 2.0
 
             # ---------------- TRIGGER LOGIC (on closed bar) ----------------
             if closed_ts is not None and df.index[-2] == closed_ts:
@@ -656,7 +716,7 @@ class BernardEngineV12:
             "gpt_comment": None,
         }
 
-    # ------------------ GPT VIRTUAL CHECK-UP ------------------
+    # ------------------ GPT VIRTUAL CHECK-UP (with CHART) ------------------
 
     @staticmethod
     def _prepare_ohlc_for_gpt(df: Optional[pd.DataFrame], max_bars: int = 60) -> List[Dict[str, Any]]:
@@ -687,6 +747,7 @@ class BernardEngineV12:
     ) -> (List[Dict[str, Any]], List[Dict[str, Any]]):
         """
         For each signal, call GPT to act as Bernard discretionary eye.
+        Now sends both JSON context and a generated chart image.
         Does NOT change base engine; only adds gpt_* fields.
         """
         if self.gpt_client is None:
@@ -698,6 +759,20 @@ class BernardEngineV12:
             symbol = sig["symbol"]
             sym_df = alts_data.get(symbol)
             sym_ohlc = self._prepare_ohlc_for_gpt(sym_df, max_bars=80)
+
+            # Generate chart PNG for this symbol + zone
+            img_bytes = b""
+            try:
+                if sym_df is not None and not sym_df.empty:
+                    img_bytes = make_signal_chart_png(
+                        sym_df,
+                        zone_top=float(sig["zone_top"]),
+                        zone_btm=float(sig["zone_btm"]),
+                        max_bars=120,
+                    )
+            except Exception as e:
+                logger.warning(f"[CHART] Failed to generate chart for {symbol}: {e}")
+                img_bytes = b""
 
             payload = {
                 "signal": sig,
@@ -712,12 +787,12 @@ class BernardEngineV12:
             }
 
             system_prompt = (
-                "You are Bernard, an expert zone trader. "
-                "You receive crypto zone-based signals from a fixed engine. "
-                "The engine already filters by structure, volume, and BTC context. "
+                "You are Bernard, an expert zone trader.\n"
+                "You receive crypto zone-based signals from a fixed engine.\n"
+                "The engine already filters by structure, volume, and BTC context.\n"
                 "Your job is a final discretionary check: "
-                "look at the provided OHLC data + signal info and decide if the trade "
-                "aligns with Bernard-style clean structure, reaction, and context.\n\n"
+                "look at the provided OHLC data, the generated chart image, and signal info, "
+                "and decide if the trade aligns with Bernard-style clean structure, reaction, and context.\n\n"
                 "Rules (do NOT change them, only apply them):\n"
                 "- Trade only if price reacts cleanly at demand/supply zones.\n"
                 "- Avoid overextended moves into a zone or messy chop right before entry.\n"
@@ -728,20 +803,36 @@ class BernardEngineV12:
                 '{"approve": bool, "quality": "A+|A|B|C", "confidence": float, "comment": str}.'
             )
 
+            # Build multimodal user content
+            user_parts: List[Dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": (
+                        "Here is the full signal + recent candles in JSON. "
+                        "Use the chart image (if provided) to judge structure, wicks, and reaction.\n\n"
+                        f"{json.dumps(payload, separators=(',', ':'))}"
+                    ),
+                }
+            ]
+
+            if img_bytes:
+                b64 = base64.b64encode(img_bytes).decode("ascii")
+                user_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}"
+                        },
+                    }
+                )
+
             try:
                 resp = self.gpt_client.chat.completions.create(
                     model=GPT_MODEL,
                     temperature=0.0,
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": (
-                                "Here is the full signal + recent candles in JSON. "
-                                "Return ONLY the JSON decision object, no extra text.\n\n"
-                                f"{json.dumps(payload, separators=(',', ':'))}"
-                            ),
-                        },
+                        {"role": "user", "content": user_parts},
                     ],
                 )
                 content = resp.choices[0].message.content.strip()
@@ -758,6 +849,7 @@ class BernardEngineV12:
                 sig["gpt_comment"] = decision.get("comment")
             except Exception as e:
                 logger.warning(f"[GPT] Failed to enrich signal {symbol}: {e}")
+                # leave gpt_* as None to indicate 'not checked'
                 pass
 
             return sig
@@ -965,7 +1057,7 @@ class BernardEngineV12:
                 f"[RESULT] total_signals={len(all_signals)}, triggers={len(triggers)}, watch={len(watch_list)}"
             )
 
-            # 4b. GPT virtual check (discretionary Bernard eye)
+            # 4b. GPT virtual check (discretionary Bernard eye, with chart)
             if self.gpt_client is not None and (triggers or watch_list):
                 triggers, watch_list = self._gpt_enrich_signals(
                     triggers, watch_list, ctx, df_btc, alts_data
