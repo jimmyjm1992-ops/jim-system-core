@@ -41,8 +41,8 @@ LIVE_STATE_PATH = LIVE_DIR / "v12_state.json"
 LIVE_HISTORY_PATH = LIVE_DIR / "v12_signals.parquet"
 DASHBOARD_JSON_PATH = LIVE_DIR / "v12_dashboard.json"
 
-# Use V11 meta model (trained on Bernard v11 base)
-META_MODEL_PATH = MODELS_DIR / "bernard_v11_meta_rf.joblib"
+# Use V12 meta model (trained on Bernard v12 base)
+META_MODEL_PATH = MODELS_DIR / "bernard_v12_meta_rf.joblib"
 
 # 46-symbol watchlist (matches the symbols seen in your logs)
 WATCHLIST: List[str] = [
@@ -97,7 +97,7 @@ class MarketContext:
 
 def encode_features(trend4: str, btc_regime: str, dom_regime: str, side: str, ztype: str):
     """
-    Encoders must match the training used for the v11 meta model.
+    Encoders must match the training used for the V12 meta model.
     """
     t_map = {"up": 1, "down": -1, "chop": 0}
     b_map = {"risk_on": 1, "risk_off": -1, "neutral": 0}
@@ -370,7 +370,7 @@ class BernardEngineV12:
             model = obj
 
         if feat_names is None:
-            # fallback: manual list used during v11 training
+            # fallback: manual list used during V12 training
             feat_names = [
                 "entry",
                 "sl",
